@@ -1,6 +1,7 @@
 package music
 
 import (
+    "context"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 // ScanDirectory scans the provided directory and processes music files
 func ScanDirectory(directory string, rdb *redis.Client) error {
+    ctx := context.Background()
 	err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err

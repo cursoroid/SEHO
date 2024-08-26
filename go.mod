@@ -1,4 +1,4 @@
-module seho
+module SEHO
 
 go 1.23.0
 
