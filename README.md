@@ -59,7 +59,7 @@ SEHO/
 
 4. **Run the Server**:
    ```bash
-   go run cmd/server/main.go
+   go run main.go
    ```
 
 5. **View Data in Redis**:
@@ -67,6 +67,13 @@ SEHO/
    ```bash
    redis-cli
    keys music:*
+   ```
+
+##Tests
+
+#### To run the tests run the following command:
+   ```bash
+   go run Tests/check_redis.go
    ```
 
 ## To-Do List
