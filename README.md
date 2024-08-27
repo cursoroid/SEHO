@@ -1,6 +1,6 @@
 # SEHO
 
-SEHO (Self-Hosted) is a self-hosted music server/platform that allows you to build and manage your own music library. It reads music files from a specified directory, scrapes their metadata, and stores the information in a Redis database, making it easy to access and manage your music collection.
+SEHO is a self-hosted music server/platform that allows you to build and manage your own music library. It reads music files from a specified directory, scrapes their metadata, and stores the information in a Redis database, making it easy to access and manage your music collection.
 
 ## Features
 
@@ -84,9 +84,9 @@ SEHO/
   - Create a `Dockerfile` and `docker-compose.yml` to manage dependencies and deployment.
 
 - **Additional Features**:
+  - Persistent storage in redis.
   - Add support for more music file formats.
   - Implement search functionality within the music library.
-  - Create a mobile-friendly version of the frontend.
 
 ## Contributing
 
