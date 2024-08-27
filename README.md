@@ -99,16 +99,3 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ## Contact
 
 For any inquiries, please contact [prathameshmudgale@gmail.com](mailto:prathameshmudgale@gmail.com).
-```
-
-### Explanation
-
-- **Features**: Describes the current capabilities of SEHO.
-- **Project Structure**: Outlines the organization of the project files and directories.
-- **Installation and Setup**: Provides detailed instructions on how to set up and run the project.
-- **To-Do List**: Lists future enhancements, including frontend development, API creation, Dockerization, and additional features.
-- **Contributing**: Encourages others to contribute to the project.
-- **License**: Notes that the project is under the MIT License.
-- **Contact**: Provides a contact email for further inquiries.
-
-Feel free to customize the contact information and repository URL as needed.
