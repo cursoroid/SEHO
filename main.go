@@ -8,6 +8,10 @@ import (
 )
 
 func main() {
+    //Setup logger and cleanup
+    cleanup := logging.SetupLogger()
+	defer cleanup()
+
 	cfg := config.LoadConfig()
 	rdb := redis.InitRedis(cfg.RedisAddress)
 	defer rdb.Close()

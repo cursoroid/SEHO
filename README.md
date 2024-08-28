@@ -7,7 +7,7 @@ SEHO is a self-hosted music server/platform that allows you to build and manage 
 - Scans a directory for music files (`.mp3`, `.flac`, `.m4a`).
 - Extracts metadata such as title, artist, album, and file path.
 - Stores music metadata in a Redis database.
-- Easily expandable with additional features such as a web frontend and APIs.
+- We are going to add a web UI in future prospects.
 
 ## Project Structure
 
