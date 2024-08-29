@@ -10,6 +10,18 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
+// StartMonitoring continuously monitors the directory for new files
+func StartMonitoring(directory string, rdb *redis.Client, interval time.Duration) {
+	for {
+		err := ScanDirectory(directory, rdb)
+		if err != nil {
+			log.Printf("Error scanning directory: %v", err)
+		}
+
+		time.Sleep(interval)
+	}
+}
+
 // ScanDirectory scans the provided directory and processes music files
 func ScanDirectory(directory string, rdb *redis.Client) error {
 	ctx := context.Background()
@@ -44,16 +56,4 @@ func ScanDirectory(directory string, rdb *redis.Client) error {
 	})
 
 	return err
-}
-
-// StartMonitoring continuously monitors the directory for new files
-func StartMonitoring(directory string, rdb *redis.Client, interval time.Duration) {
-	for {
-		err := ScanDirectory(directory, rdb)
-		if err != nil {
-			log.Printf("Error scanning directory: %v", err)
-		}
-
-		time.Sleep(interval)
-	}
 }

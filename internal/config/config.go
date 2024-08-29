@@ -2,8 +2,8 @@ package config
 
 import (
 	"os"
-    "path/filepath"
-    "strings"
+	"path/filepath"
+	"strings"
 )
 
 type Config struct {
@@ -13,7 +13,7 @@ type Config struct {
 
 func LoadConfig() Config {
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
-	musicDir := getEnv("MUSIC_DIR", "./music")
+	musicDir := getEnv("MUSIC_DIR", "~/Music")
 
 	if strings.HasPrefix(musicDir, "~") {
 		homeDir, err := os.UserHomeDir()
@@ -34,4 +34,3 @@ func getEnv(key, fallback string) string {
 	}
 	return fallback
 }
-
