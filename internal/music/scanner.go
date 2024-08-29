@@ -1,17 +1,18 @@
 package music
 
 import (
-    "context"
+	"context"
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 )
 
 // ScanDirectory scans the provided directory and processes music files
 func ScanDirectory(directory string, rdb *redis.Client) error {
-    ctx := context.Background()
+	ctx := context.Background()
 	err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -31,7 +32,10 @@ func ScanDirectory(directory string, rdb *redis.Client) error {
 			}
 
 			key := "music:" + info.Name()
-			rdb.HSet(ctx, key, metadata)
+			_, err = rdb.HSet(ctx, key, metadata).Result()
+			if err != nil {
+				log.Printf("Error adding to Redis: %v", err)
+			}
 
 			log.Printf("Added to Redis: %s", info.Name())
 		}
@@ -42,3 +46,14 @@ func ScanDirectory(directory string, rdb *redis.Client) error {
 	return err
 }
 
+// StartMonitoring continuously monitors the directory for new files
+func StartMonitoring(directory string, rdb *redis.Client, interval time.Duration) {
+	for {
+		err := ScanDirectory(directory, rdb)
+		if err != nil {
+			log.Printf("Error scanning directory: %v", err)
+		}
+
+		time.Sleep(interval)
+	}
+}

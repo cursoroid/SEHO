@@ -14,14 +14,10 @@ func main() {
 	defer cleanup()
 
 	cfg := config.LoadConfig()
-	rdb := redis.InitRedis(cfg.RedisAddress)
-	defer rdb.Close()
+	rdb := redis.NewClient(&redis.Options{
+        Addr: cfg:RedisAddress,
+        )}
 
-	err := music.ScanDirectory(cfg.MusicDirectory, rdb)
-	if err != nil {
-		log.Fatalf("Error scanning music directory: %v", err)
-	}
-
-	log.Println("Music library successfully stored in Redis")
+	music.StartMonitoring(cfg.MusicDirectory, rdb, 10*time.Second)
 }
 
