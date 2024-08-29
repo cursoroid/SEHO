@@ -5,6 +5,7 @@ import (
 	"SEHO/internal/config"
 	"SEHO/internal/music"
 	"SEHO/internal/redis"
+    "SEHO/internal/logging"
 )
 
 func main() {
