@@ -14,13 +14,13 @@ SEHO is a self-hosted music server/platform that allows you to build and manage 
 ```
 SEHO/
 │
-├── cmd/
-│   └── server/
-│       └── main.go
+├── main.go
 │
 ├── internal/
 │   ├── config/
 │   │   └── config.go
+│   ├──logging/
+│   │   └── logging.go
 │   ├── redis/
 │   │   └── client.go
 │   └── music/
@@ -28,7 +28,9 @@ SEHO/
 │       └── scanner.go
 │
 ├── go.mod
-└── go.sum
+├── go.sum 
+│
+└── README.md 
 ```
 
 ## Installation and Setup
