@@ -5,7 +5,7 @@ import (
 	"SEHO/internal/config"
 	"SEHO/internal/music"
     "SEHO/internal/logging"
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 
 )
 
