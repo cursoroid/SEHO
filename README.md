@@ -21,8 +21,6 @@ SEHO/
 │   │   └── config.go
 │   ├──logging/
 │   │   └── logging.go
-│   ├── redis/
-│   │   └── client.go
 │   └── music/
 │       ├── metadata.go
 │       └── scanner.go
@@ -83,10 +81,14 @@ SEHO/
 - **Frontend Development**:
   - Create a web-based frontend to browse and play music from the library.
   - Implement user authentication and music streaming functionality.
+  - Playslist and Music Art display features to be added
 
 - **API Development**:
   - Expose RESTful or GraphQL APIs to interact with the music library.
   - Implement endpoints for querying music metadata and streaming music files.
+
+- **Music Delivery/Streaming**
+  - Use ffmpeg or similar library to implemet streaming functionality.
 
 - **Dockerization**:
   - Dockerize the application to make deployment easier.
