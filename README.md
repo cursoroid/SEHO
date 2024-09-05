@@ -69,7 +69,7 @@ SEHO/
    keys music:*
    ```
 
-##Tests
+## Tests
 
 #### To run the tests run the following command:
    ```bash
