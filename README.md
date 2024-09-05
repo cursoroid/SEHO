@@ -81,7 +81,9 @@ SEHO/
 - **Frontend Development**:
   - Create a web-based frontend to browse and play music from the library.
   - Implement user authentication and music streaming functionality.
-  - Playslist and Music Art display features to be added
+  - Playslist and Music Art display features to be added10.24297/ijct.v11i7.3470
+
+Keywords: ECG, Adaptive filtering, the least mean square (LMS) algorithm, ST segment. 
 
 - **API Development**:
   - Expose RESTful or GraphQL APIs to interact with the music library.

@@ -27,4 +27,3 @@ func IsMusicFile(filename string) bool {
 	lowerName := strings.ToLower(filename)
 	return strings.HasSuffix(lowerName, ".mp3") || strings.HasSuffix(lowerName, ".flac") || strings.HasSuffix(lowerName, ".m4a")
 }
-
