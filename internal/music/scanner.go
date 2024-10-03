@@ -2,39 +2,54 @@ package music
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 // StartMonitoring continuously monitors the directory for new files
-func StartMonitoring(directory string, rdb *redis.Client, interval time.Duration) {
-	for {
-		err := ScanDirectory(directory, rdb)
-		if err != nil {
-			log.Printf("Error scanning directory: %v", err)
-		}
-
-		time.Sleep(interval)
+func StartMonitoring(directory string, rdb *redis.Client) error {
+	filesAdded, err := ScanDirectory(directory, rdb)
+	if err != nil {
+		return fmt.Errorf("error scanning directory: %v", err)
 	}
+	
+	if filesAdded == 0 {
+		log.Println("No new files found in the directory")
+	} else {
+		log.Printf("Total files added: %d", filesAdded)
+	}
+	
+	return nil
 }
 
 // ScanDirectory scans the provided directory and processes music files
-func ScanDirectory(directory string, rdb *redis.Client) error {
+func ScanDirectory(directory string, rdb *redis.Client) (int, error) {
 	ctx := context.Background()
-	empty := true // Flag to check if the directory is empty
+	filesAdded := 0
 
 	err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// If a music file is found, set empty to false
 		if !info.IsDir() && IsMusicFile(info.Name()) {
-			empty = false
+			key := "music:" + info.Name()
+
+			// Check if the file is already in Redis
+			exists, err := rdb.Exists(ctx, key).Result()
+			if err != nil {
+				log.Printf("Error checking Redis for file %s: %v", path, err)
+				return nil // Continue to next file
+			}
+
+			if exists == 1 {
+				log.Printf("File already processed: %s", info.Name())
+				return nil // Skip this file, it's already processed
+			}
 
 			file, err := os.Open(path)
 			if err != nil {
@@ -49,7 +64,6 @@ func ScanDirectory(directory string, rdb *redis.Client) error {
 				return nil // Skip processing this file
 			}
 
-			key := "music:" + info.Name()
 			_, err = rdb.HSet(ctx, key, metadata).Result()
 			if err != nil {
 				log.Printf("Error adding to Redis for file %s: %v", path, err)
@@ -57,15 +71,14 @@ func ScanDirectory(directory string, rdb *redis.Client) error {
 			}
 
 			log.Printf("Successfully added to Redis: %s", info.Name())
+			filesAdded++
 		}
-
 		return nil
 	})
 
-	// If the directory is empty, log an error
-	if empty {
-		log.Printf("Error: Directory '%s' is empty", directory)
+	if err != nil {
+		return filesAdded, fmt.Errorf("error walking through directory: %v", err)
 	}
 
-	return err
+	return filesAdded, nil
 }
