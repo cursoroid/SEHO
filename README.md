@@ -22,8 +22,10 @@ SEHO/
 │   ├──logging/
 │   │   └── logging.go
 │   └── music/
-│       ├── metadata.go
-│       └── scanner.go
+│   │   ├── metadata.go
+│   │   └── scanner.go
+│   └── streaming
+│        └── streaming.go
 │
 ├── go.mod
 ├── go.sum 
