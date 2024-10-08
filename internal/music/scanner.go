@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -16,13 +17,13 @@ func StartMonitoring(directory string, rdb *redis.Client) error {
 	if err != nil {
 		return fmt.Errorf("error scanning directory: %v", err)
 	}
-	
+
 	if filesAdded == 0 {
 		log.Println("No new files found in the directory")
 	} else {
 		log.Printf("Total files added: %d", filesAdded)
 	}
-	
+
 	return nil
 }
 
@@ -64,6 +65,22 @@ func ScanDirectory(directory string, rdb *redis.Client) (int, error) {
 				return nil // Skip processing this file
 			}
 
+			// Fetch tags for the artist and track
+			tags, err := FetchTags(metadata["artist"].(string), metadata["title"].(string))
+			if err != nil {
+				log.Printf("Error fetching tags for %s: %v", info.Name(), err)
+				return nil // Log error but continue
+			}
+
+			// Limit tags to top 5
+			if len(tags) > 3 {
+				tags = tags[:3] // Take only the first 5 tags
+			}
+
+			// Add tags to the metadata as a comma-separated string
+			metadata["tags"] = strings.Join(tags, ",") // Convert tags slice to a comma-separated string
+
+			// Store metadata with tags in Redis
 			_, err = rdb.HSet(ctx, key, metadata).Result()
 			if err != nil {
 				log.Printf("Error adding to Redis for file %s: %v", path, err)
