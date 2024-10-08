@@ -1,12 +1,25 @@
 package music
 
 import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
 	"github.com/dhowden/tag"
 )
+
+// LastFMResponse represents the structure of the response from Last.fm API
+type LastFMResponse struct {
+	Toptags struct {
+		Tag []struct {
+			Name string `json:"name"`
+		} `json:"tag"`
+	} `json:"toptags"`
+}
 
 // ExtractMetadata extracts essential metadata from the given file using the dhowden/tag package.
 // Logs errors if metadata extraction fails.
@@ -47,4 +60,38 @@ func IsMusicFile(filename string) bool {
 
 	log.Printf("Error: Unsupported file format for file %s", filename)
 	return false
+}
+
+// FetchTags retrieves tags for a given artist and track from the Last.fm API
+func FetchTags(artist, track string) ([]string, error) {
+	apiKey := "2651159b799407e6c1739b357739d5ef" // Your Last.fm API key
+	url := fmt.Sprintf("https://ws.audioscrobbler.com/2.0/?method=track.gettoptags&artist=%s&track=%s&api_key=%s&format=json", artist, track, apiKey)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make API request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status: %s", resp.Status)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	var lastFMResponse LastFMResponse
+	if err := json.Unmarshal(body, &lastFMResponse); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
+	}
+
+	// Extract tags from the response
+	var tags []string
+	for _, tag := range lastFMResponse.Toptags.Tag {
+		tags = append(tags, tag.Name)
+	}
+
+	return tags, nil
 }
