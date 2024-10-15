@@ -6,8 +6,10 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/dhowden/tag"
 )
@@ -27,7 +29,7 @@ func ExtractMetadata(file *os.File) (map[string]interface{}, error) {
 	// Use tag.ReadFrom to parse metadata from the file
 	metadata, err := tag.ReadFrom(file)
 	if err != nil {
-		log.Printf("Error reading metadata from file %s: %v", file.Name(), err)
+		log.Printf("error reading metadata from file %s: %v", file.Name(), err)
 		return nil, err
 	}
 
@@ -58,40 +60,59 @@ func IsMusicFile(filename string) bool {
 		return true
 	}
 
-	log.Printf("Error: Unsupported file format for file %s", filename)
+	log.Printf("error: unsupported file format for file %s", filename)
 	return false
 }
 
-// FetchTags retrieves tags for a given artist and track from the Last.fm API
+// FetchTags retrieves tags for a given artist and track from the Last.fm API with a timeout.
 func FetchTags(artist, track string) ([]string, error) {
 	apiKey := "2651159b799407e6c1739b357739d5ef" // Your Last.fm API key
-	url := fmt.Sprintf("https://ws.audioscrobbler.com/2.0/?method=track.gettoptags&artist=%s&track=%s&api_key=%s&format=json", artist, track, apiKey)
 
-	resp, err := http.Get(url)
+	// Encode artist and track to handle special characters
+	artistEncoded := url.QueryEscape(artist)
+	trackEncoded := url.QueryEscape(track)
+
+	apiURL := fmt.Sprintf(
+		"https://ws.audioscrobbler.com/2.0/?method=track.gettoptags&artist=%s&track=%s&api_key=%s&format=json",
+		artistEncoded, trackEncoded, apiKey,
+	)
+
+	log.Printf("fetching tags from URL: %s", apiURL)
+
+	// Create an HTTP client with a timeout to avoid hanging requests
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	// Make the API request
+	resp, err := client.Get(apiURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to make API request: %v", err)
+		return nil, fmt.Errorf("api request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status: %s", resp.Status)
+		body, _ := ioutil.ReadAll(resp.Body)
+		log.Printf("api request failed: %s - %s", resp.Status, string(body))
+		return nil, fmt.Errorf("api returned non-200 status: %s", resp.Status)
 	}
 
+	// Read the response body
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %v", err)
+		return nil, fmt.Errorf("error reading api response: %v", err)
 	}
 
 	var lastFMResponse LastFMResponse
 	if err := json.Unmarshal(body, &lastFMResponse); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
+		return nil, fmt.Errorf("error parsing api response: %v", err)
 	}
 
-	// Extract tags from the response
 	var tags []string
 	for _, tag := range lastFMResponse.Toptags.Tag {
 		tags = append(tags, tag.Name)
 	}
 
+	log.Printf("fetched tags: %v", tags)
 	return tags, nil
 }

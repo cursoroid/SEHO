@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -19,9 +20,9 @@ func StartMonitoring(directory string, rdb *redis.Client) error {
 	}
 
 	if filesAdded == 0 {
-		log.Println("No new files found in the directory")
+		log.Println("no new files found in the directory")
 	} else {
-		log.Printf("Total files added: %d", filesAdded)
+		log.Printf("total files added: %d", filesAdded)
 	}
 
 	return nil
@@ -38,56 +39,64 @@ func ScanDirectory(directory string, rdb *redis.Client) (int, error) {
 		}
 
 		if !info.IsDir() && IsMusicFile(info.Name()) {
+			log.Printf("processing file: %s", path)
 			key := "music:" + info.Name()
 
 			// Check if the file is already in Redis
+			log.Printf("checking if file %s is already in redis", key)
 			exists, err := rdb.Exists(ctx, key).Result()
 			if err != nil {
-				log.Printf("Error checking Redis for file %s: %v", path, err)
+				log.Printf("error checking redis for file %s: %v", path, err)
 				return nil // Continue to next file
 			}
 
 			if exists == 1 {
-				log.Printf("File already processed: %s", info.Name())
+				log.Printf("file already processed: %s", info.Name())
 				return nil // Skip this file, it's already processed
 			}
 
 			file, err := os.Open(path)
 			if err != nil {
-				log.Printf("Error opening file %s: %v", path, err)
+				log.Printf("error opening file %s: %v", path, err)
 				return nil // Skip the file, continue to next
 			}
 			defer file.Close()
 
 			metadata, err := ExtractMetadata(file)
 			if err != nil {
-				log.Printf("Could not read metadata from file %s: %v", path, err)
+				log.Printf("could not read metadata from file %s: %v", path, err)
 				return nil // Skip processing this file
 			}
 
 			// Fetch tags for the artist and track
+			log.Printf("fetching tags for artist: %s, title: %s", metadata["artist"], metadata["title"])
 			tags, err := FetchTags(metadata["artist"].(string), metadata["title"].(string))
 			if err != nil {
-				log.Printf("Error fetching tags for %s: %v", info.Name(), err)
+				log.Printf("error fetching tags for %s: %v", info.Name(), err)
 				return nil // Log error but continue
 			}
 
-			// Limit tags to top 5
+			// Limit tags to top 3
 			if len(tags) > 3 {
-				tags = tags[:3] // Take only the first 5 tags
+				tags = tags[:3] // Take only the first 3 tags
 			}
 
 			// Add tags to the metadata as a comma-separated string
 			metadata["tags"] = strings.Join(tags, ",") // Convert tags slice to a comma-separated string
 
+			// Add the upload date and time
+			now := time.Now().In(time.FixedZone("IST", 5*60*60+30*60)) // IST (UTC+5:30)
+			metadata["upload_date"] = now.Format("02/01/2006")         // Format: dd/mm/yyyy
+			metadata["upload_time"] = now.Format("03:04 PM")           // Format: 12-hour with AM/PM
+
 			// Store metadata with tags in Redis
 			_, err = rdb.HSet(ctx, key, metadata).Result()
 			if err != nil {
-				log.Printf("Error adding to Redis for file %s: %v", path, err)
+				log.Printf("error adding to redis for file %s: %v", path, err)
 				return nil // Log error but don't stop the scanning process
 			}
 
-			log.Printf("Successfully added to Redis: %s", info.Name())
+			log.Printf("successfully added to redis: %s", info.Name())
 			filesAdded++
 		}
 		return nil
