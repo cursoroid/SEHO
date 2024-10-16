@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dhowden/tag"
+	"github.com/joho/godotenv"
 )
 
 // LastFMResponse represents the structure of the response from Last.fm API
@@ -51,7 +52,6 @@ func ExtractMetadata(file *os.File) (map[string]interface{}, error) {
 // Logs errors if the file is unsupported or has an invalid extension.
 func IsMusicFile(filename string) bool {
 	lowerName := strings.ToLower(filename)
-
 	// Check for supported extensions
 	if strings.HasSuffix(lowerName, ".mp3") ||
 		strings.HasSuffix(lowerName, ".flac") ||
@@ -66,14 +66,19 @@ func IsMusicFile(filename string) bool {
 
 // FetchTags retrieves tags for a given artist and track from the Last.fm API with a timeout.
 func FetchTags(artist, track string) ([]string, error) {
-	apiKey := "2651159b799407e6c1739b357739d5ef" // Your Last.fm API key
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
+	apiKey := os.Getenv("API_KEY")
 
 	// Encode artist and track to handle special characters
 	artistEncoded := url.QueryEscape(artist)
 	trackEncoded := url.QueryEscape(track)
-
+  
+  url := os.Getenv("API_KEY")
 	apiURL := fmt.Sprintf(
-		"https://ws.audioscrobbler.com/2.0/?method=track.gettoptags&artist=%s&track=%s&api_key=%s&format=json",
+		url,
 		artistEncoded, trackEncoded, apiKey,
 	)
 
