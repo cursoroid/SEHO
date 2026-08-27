@@ -364,11 +364,11 @@ func (u *UI) bindKeys() {
 			u.playRow(u.playing - 1)
 			return nil
 		case '-':
-			u.vol -= 5
+			u.vol = clampVol(u.vol - 5)
 			u.pl.SetVolume(u.vol)
 			return nil
 		case '=':
-			u.vol += 5
+			u.vol = clampVol(u.vol + 5)
 			u.pl.SetVolume(u.vol)
 			return nil
 		}

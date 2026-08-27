@@ -195,10 +195,27 @@ func (p *Player) send(args ...any) error {
 	}
 }
 
+// post writes a command without waiting for mpv's reply. Ordering is preserved
+// because all writes go through the same mutex-serialised connection.
+// ponytail: transport commands are fire-and-forget on purpose — mpv's
+// property-change events are the authoritative record of what actually took
+// effect, so an optimistic local update reconciled by the event beats blocking
+// the UI goroutine for a reply we would only use to second-guess it.
+func (p *Player) post(args ...any) error {
+	payload, err := json.Marshal(map[string]any{"command": args})
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, err = p.conn.Write(append(payload, '\n'))
+	return err
+}
+
 func (p *Player) Load(path string) error   { return p.send("loadfile", path, "replace") }
-func (p *Player) TogglePause() error       { return p.send("cycle", "pause") }
-func (p *Player) Seek(delta float64) error { return p.send("seek", delta, "relative") }
-func (p *Player) SetVolume(v int) error    { return p.send("set_property", "volume", clampVol(v)) }
+func (p *Player) TogglePause() error       { return p.post("cycle", "pause") }
+func (p *Player) Seek(delta float64) error { return p.post("seek", delta, "relative") }
+func (p *Player) SetVolume(v int) error    { return p.post("set_property", "volume", clampVol(v)) }
 func (p *Player) Stop() error              { return p.send("stop") }
 
 func (p *Player) Close() error {
