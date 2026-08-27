@@ -24,10 +24,15 @@ const keyPrefix = "music:"
 var musicExts = []string{".mp3", ".flac", ".m4a", ".ogg"}
 
 // probeDuration returns the track length in seconds, or 0 if ffprobe is
-// unavailable or cannot read the file. A zero here is backfilled from mpv
+// unavailable, fails, or takes too long. A zero here is backfilled from mpv
 // the first time the track plays.
-func probeDuration(path string) float64 {
-	out, err := exec.Command("ffprobe", "-v", "error",
+// ponytail: 10s is generous for a header read and bounds the stall a FIFO or a
+// dead network mount would otherwise cause.
+func probeDuration(ctx context.Context, path string) float64 {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "ffprobe", "-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1", path).Output()
 	if err != nil {
@@ -120,7 +125,7 @@ func indexFile(ctx context.Context, path string, rdb *redis.Client) (bool, error
 		"trackNumber": trackNumber,
 		"path":        path,
 		"added_at":    time.Now().Format(time.RFC3339),
-		"duration":    probeDuration(path),
+		"duration":    probeDuration(ctx, path),
 	}).Err()
 	if err != nil {
 		return false, err
