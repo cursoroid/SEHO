@@ -1,121 +1,78 @@
 # SEHO
 
-SEHO is a self-hosted music server/platform that allows you to build and manage your own music library. It reads music files from a specified directory, scrapes their metadata, and stores the information in a Redis database, making it easy to access and manage your music collection.
+Self-hosted music library. A terminal UI that indexes a music directory into
+Redis and plays tracks through `ffplay`.
 
 ## Features
 
-- Scans a directory for music files (`.mp3`, `.flac`, `.m4a`).
-- Extracts metadata such as title, artist, album, and file path.
-- Stores music metadata in a Redis database.
-- We are going to add a web UI in future prospects.
+- Scans a directory for `.mp3`, `.flac`, `.m4a` and `.ogg` files.
+- Stores title, album, artist, year, track number and path in Redis.
+- Browse the indexed library and play a track without leaving the terminal.
 
-## Project Structure
+## Requirements
 
-```
-SEHO/
-│
-├── main.go
-│
-├── internal/
-│   ├── config/
-│   │   └── config.go
-│   ├──logging/
-│   │   └── logging.go
-│   └── music/
-│   │   ├── metadata.go
-│   │   └── scanner.go
-│   └── streaming
-│        └── streaming.go
-│
-├── go.mod
-├── go.sum 
-│
-└── README.md 
+- [Go](https://golang.org/dl/) 1.23+
+- [Redis](https://redis.io/download) reachable at `REDIS_ADDR`
+- `ffplay` (ships with [FFmpeg](https://ffmpeg.org/)) for playback
+
+## Configuration
+
+All optional:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MUSIC_DIR` | `~/Music` | Directory to index |
+| `REDIS_ADDR` | `localhost:6379` | Redis address |
+
+## Run
+
+```bash
+go run .
 ```
 
-## Installation and Setup
+Keeping the variables in a `.env` file works too — the shell loads it, not the app:
 
-### Prerequisites
+```bash
+set -a; . ./.env; set +a
+go run .
+```
 
-1. **Go**: [Install Go](https://golang.org/dl/).
-2. **Redis**: [Install Redis](https://redis.io/download).
+`.env` is gitignored. Never commit it.
 
-### Steps
+## Usage
 
-1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/cursoroid/SEHO.git
-   cd SEHO
-   ```
+| Key | Action |
+|---|---|
+| `enter` | Activate the selected menu entry or play the selected track |
+| `esc` | Leave the library, back to the menu |
+| `/` | Filter the current list |
+| `ctrl+c` | Stop playback and quit |
 
-2. **Initialize Go Modules**:
-   ```bash
-   go mod tidy
-   ```
+Logs go to `logs/seho.log`. Inspect the raw index with `redis-cli --scan --pattern 'music:*'`.
 
-3. **Set Environment Variables**:
-   ```bash
-   export REDIS_ADDR="localhost:6379"
-   export MUSIC_DIR="/path/to/music/directory"
-   ```
+## To-Do
 
-4. **Run the Server**:
-   ```bash
-   go run main.go
-   ```
-
-5. **View Data in Redis**:
-   Use the Redis CLI to inspect the stored music metadata.
-   ```bash
-   redis-cli
-   keys music:*
-   ```
-
-## Tests
-
-#### To run the tests run the following command:
-   ```bash
-   go run Tests/check_redis.go
-   ```
-
-## To-Do List
-
-- **Frontend Development**:
-  - Create a web-based frontend to browse and play music from the library.
-  - Implement user authentication and music streaming functionality.
-  - Playslist and Music Art display features to be added10.24297/ijct.v11i7.3470
-
-Keywords: ECG, Adaptive filtering, the least mean square (LMS) algorithm, ST segment. 
-
-- **API Development**:
-  - Expose RESTful or GraphQL APIs to interact with the music library.
-  - Implement endpoints for querying music metadata and streaming music files.
-
-- **Music Delivery/Streaming**
-  - Use ffmpeg or similar library to implemet streaming functionality.
-
-- **Dockerization**:
-  - Dockerize the application to make deployment easier.
-  - Create a `Dockerfile` and `docker-compose.yml` to manage dependencies and deployment.
-
-- **Additional Features**:
-  - Persistent storage in redis.
-  - Add support for more music file formats.
-  - Implement search functionality within the music library.
+- **API**: expose the library over HTTP so clients other than the TUI can use it.
+- **Streaming**: serve audio over HTTP instead of shelling out to a local `ffplay`.
+- **Frontend**: a web UI, once the API exists.
+- **Docker**: worth doing once there is a server to run; a TTY-only TUI is not.
+- **Search**: query the library by tag, artist or album.
+- **Durability**: enable Redis AOF or RDB, or the scraped tags vanish on restart.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request or open an Issue for any bugs or feature requests.
+Contributions are welcome. Open an Issue or a Pull Request.
 
 ## Contributors
+
 <a href="https://github.com/cursoroid/SEHO/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=cursoroid/SEHO" />
 </a>
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).
 
 ## Contact
 
-For any inquiries, please contact [prathameshmudgale@gmail.com](mailto:prathameshmudgale@gmail.com).
+[prathameshmudgale@gmail.com](mailto:prathameshmudgale@gmail.com)

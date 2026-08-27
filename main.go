@@ -1,122 +1,79 @@
 package main
 
 import (
+	"cmp"
+	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
-
-	"SEHO/internal/config"
-	"SEHO/internal/logging"
-	"SEHO/internal/music"
-	"SEHO/internal/streaming"
+	"path/filepath"
 
 	"github.com/charmbracelet/bubbles/list"
-	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/redis/go-redis/v9"
 )
 
-type item struct {
-	title, desc string
-}
+type item struct{ title, desc, path string }
 
 func (i item) Title() string       { return i.title }
 func (i item) Description() string { return i.desc }
 func (i item) FilterValue() string { return i.title }
 
+var menu = []list.Item{
+	item{title: "Scan Directory", desc: "Index new music files"},
+	item{title: "Browse Library", desc: "Pick a track and play it"},
+	item{title: "Stop Playback", desc: "Stop the current track"},
+	item{title: "Quit", desc: "Exit"},
+}
+
+type statusMsg string
+
 type model struct {
 	list     list.Model
-	cfg      config.Config
 	rdb      *redis.Client
-	streamer *streaming.Streamer
-	spinner  spinner.Model
-	scanning bool
-	result   string
-	playing  bool
-	current  string
+	dir      string
+	player   *player
+	status   string
+	browsing bool
 }
 
-func initialModel() model {
-	cfg := config.LoadConfig()
-	rdb := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisAddress,
-	})
-
-	items := []list.Item{
-		item{title: "Scan Directory", desc: "Scan for new music files"},
-		item{title: "List All Music", desc: "Select the music from the list"},
-		item{title: "Stream Music", desc: "Select and stream a music file"},
-		item{title: "Stop Streaming", desc: "Stop the currently playing music"},
-		item{title: "Quit", desc: "Exit the application"},
-	}
-
-	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "SEHO Music Server"
-
-	s := spinner.New()
-	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
-
-	streamer := streaming.NewStreamer(rdb, cfg.MusicDirectory)
-
-	return model{
-		list:     l,
-		cfg:      cfg,
-		rdb:      rdb,
-		streamer: streamer,
-		spinner:  s,
-		scanning: false,
-		playing:  false,
-	}
-}
-
-func (m model) Init() tea.Cmd {
-	return nil
-}
+func (m model) Init() tea.Cmd { return nil }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.list.SetWidth(msg.Width)
-		m.list.SetHeight(msg.Height - 4)
+		m.list.SetSize(msg.Width, msg.Height-2)
+		return m, nil
+
+	case statusMsg:
+		m.status = string(msg)
 		return m, nil
 
 	case tea.KeyMsg:
-		switch keypress := msg.String(); keypress {
+		switch msg.String() {
 		case "ctrl+c":
-			m.streamer.StopStreaming()
+			m.player.stop()
 			return m, tea.Quit
-		case "enter":
-			i, ok := m.list.SelectedItem().(item)
-			if ok {
-				switch i.title {
-				case "Scan Directory":
-					m.scanning = true
-					m.result = ""
-					return m, m.startScanning
-				case "Stream Music":
-					return m, m.startStreaming()
-				case "Stop Streaming":
-					m.streamer.StopStreaming()
-					m.playing = false
-					m.current = ""
-					return m, nil
-				case "Quit":
-					m.streamer.StopStreaming()
-					return m, tea.Quit
-				}
+		case "esc":
+			if m.browsing {
+				return m.showMenu(), nil
 			}
+		case "enter":
+			sel, ok := m.list.SelectedItem().(item)
+			if !ok {
+				break
+			}
+			if m.browsing {
+				if err := m.player.play(sel.path); err != nil {
+					m.status = fmt.Sprintf("Playback failed: %v", err)
+				} else {
+					m.status = "Playing: " + sel.title
+				}
+				return m, nil
+			}
+			return m.menuAction(sel.title)
 		}
-	
-	case scanResultMsg:
-		m.scanning = false
-		m.result = string(msg)
-		return m, nil
-	
-	case streamResultMsg:
-		m.playing = msg.playing
-		m.current = msg.current
-		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -125,58 +82,104 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	s := m.list.View() + "\n"
-
-	if m.scanning {
-		s += fmt.Sprintf("%s Scanning directory...\n", m.spinner.View())
-	} else if m.result != "" {
-		s += m.result + "\n"
+	if m.status == "" {
+		return m.list.View()
 	}
-
-	if m.playing {
-		s += fmt.Sprintf("Now playing: %s\n", m.current)
-	}
-
-	return s
+	return m.list.View() + "\n" + m.status
 }
 
-type scanResultMsg string
+func (m model) menuAction(title string) (tea.Model, tea.Cmd) {
+	switch title {
+	case "Scan Directory":
+		m.status = "Scanning " + m.dir + "..."
+		return m, scanCmd(m.dir, m.rdb)
 
-type streamResultMsg struct {
-	playing bool
-	current string
-}
-
-func (m model) startScanning() tea.Msg {
-	filesAdded, err := music.ScanDirectory(m.cfg.MusicDirectory, m.rdb)
-	if err != nil {
-		return scanResultMsg(fmt.Sprintf("Error scanning directory: %v", err))
-	}
-	if filesAdded == 0 {
-		return scanResultMsg("No new files found in the directory")
-	}
-	return scanResultMsg(fmt.Sprintf("Total files added: %d", filesAdded))
-}
-
-func (m model) startStreaming() tea.Cmd {
-	return func() tea.Msg {
-		playing, current, err := m.streamer.StreamMusic()
-		if err != nil {
-			return streamResultMsg{playing: false, current: fmt.Sprintf("Error: %v", err)}
+	case "Browse Library":
+		items, err := listTracks(context.Background(), m.rdb)
+		switch {
+		case err != nil:
+			m.status = fmt.Sprintf("Could not read library: %v", err)
+		case len(items) == 0:
+			m.status = "Library is empty - scan first"
+		default:
+			m.browsing = true
+			m.status = ""
+			m.list.Title = "Library (esc to go back)"
+			m.list.SetItems(items)
 		}
-		fmt.Printf("Debug: Streaming started. Playing: %v, Current: %s\n", playing, current)
-		
-		return streamResultMsg{playing: playing, current: current}
+		return m, nil
+
+	case "Stop Playback":
+		m.player.stop()
+		m.status = "Stopped"
+		return m, nil
+
+	case "Quit":
+		m.player.stop()
+		return m, tea.Quit
 	}
+	return m, nil
+}
+
+func (m model) showMenu() model {
+	m.browsing = false
+	m.status = ""
+	m.list.Title = "SEHO"
+	m.list.SetItems(menu)
+	return m
+}
+
+func scanCmd(dir string, rdb *redis.Client) tea.Cmd {
+	return func() tea.Msg {
+		n, err := scanDirectory(context.Background(), dir, rdb)
+		if err != nil {
+			return statusMsg(fmt.Sprintf("Scan failed: %v", err))
+		}
+		return statusMsg(fmt.Sprintf("Indexed %d new file(s)", n))
+	}
+}
+
+// setupLog sends log output to logs/seho.log, or nowhere if that is not writable.
+// ponytail: never stderr - this is an alt-screen TUI and stray writes corrupt the render.
+func setupLog() func() {
+	if err := os.MkdirAll("logs", 0o755); err == nil {
+		f, err := os.OpenFile(filepath.Join("logs", "seho.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err == nil {
+			log.SetOutput(f)
+			return func() { f.Close() }
+		}
+	}
+	log.SetOutput(io.Discard)
+	return func() {}
+}
+
+func defaultMusicDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	return filepath.Join(home, "Music")
 }
 
 func main() {
-	cleanup := logging.SetupLogger()
-	defer cleanup()
+	closeLog := setupLog()
+	defer closeLog()
 
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running program: %v", err)
+	dir := cmp.Or(os.Getenv("MUSIC_DIR"), defaultMusicDir())
+	rdb := redis.NewClient(&redis.Options{Addr: cmp.Or(os.Getenv("REDIS_ADDR"), "localhost:6379")})
+	defer rdb.Close()
+
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "redis unreachable: %v\n", err)
+		os.Exit(1)
+	}
+
+	l := list.New(menu, list.NewDefaultDelegate(), 0, 0)
+	l.Title = "SEHO"
+
+	m := model{list: l, rdb: rdb, dir: dir, player: &player{}}
+	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 }
