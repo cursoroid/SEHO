@@ -41,6 +41,13 @@ func defaultMusicDir() string {
 }
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	closeLog := setupLog()
 	defer closeLog()
 
@@ -50,19 +57,14 @@ func main() {
 	})
 	defer rdb.Close()
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "redis unreachable: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("redis unreachable: %w", err)
 	}
 
 	pl, err := StartPlayer()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	defer pl.Close()
 
-	if err := NewUI(rdb, dir, pl).Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
+	return NewUI(rdb, dir, pl).Run()
 }
