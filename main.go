@@ -14,7 +14,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type item struct{ title, desc, path string }
+type item struct {
+	title    string
+	desc     string
+	path     string
+	duration float64
+}
 
 func (i item) Title() string       { return i.title }
 func (i item) Description() string { return i.desc }

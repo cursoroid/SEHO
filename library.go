@@ -7,8 +7,10 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +22,42 @@ import (
 const keyPrefix = "music:"
 
 var musicExts = []string{".mp3", ".flac", ".m4a", ".ogg"}
+
+// probeDuration returns the track length in seconds, or 0 if ffprobe is
+// unavailable or cannot read the file. A zero here is backfilled from mpv
+// the first time the track plays.
+func probeDuration(path string) float64 {
+	out, err := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1", path).Output()
+	if err != nil {
+		return 0
+	}
+	sec, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0
+	}
+	return sec
+}
+
+func fmtDuration(sec float64) string {
+	if sec <= 0 {
+		return "--:--"
+	}
+	total := int(sec + 0.5)
+	return fmt.Sprintf("%02d:%02d", total/60, total%60)
+}
+
+// backfillDuration records a duration mpv discovered, for tracks indexed
+// without ffprobe. Best effort: a failure here costs only the TIME column.
+func backfillDuration(ctx context.Context, rdb *redis.Client, path string, sec float64) {
+	if sec <= 0 {
+		return
+	}
+	if err := rdb.HSet(ctx, keyPrefix+path, "duration", sec).Err(); err != nil {
+		log.Printf("backfill duration for %s: %v", path, err)
+	}
+}
 
 // scanDirectory indexes every music file under dir that Redis has not seen yet.
 // Per-file problems are logged and skipped; only an unusable dir is an error.
@@ -82,6 +120,7 @@ func indexFile(ctx context.Context, path string, rdb *redis.Client) (bool, error
 		"trackNumber": trackNumber,
 		"path":        path,
 		"added_at":    time.Now().Format(time.RFC3339),
+		"duration":    probeDuration(path),
 	}).Err()
 	if err != nil {
 		return false, err
@@ -105,10 +144,12 @@ func listTracks(ctx context.Context, rdb *redis.Client) ([]list.Item, error) {
 		if err != nil {
 			return nil, err
 		}
+		dur, _ := strconv.ParseFloat(h["duration"], 64)
 		items = append(items, item{
-			title: cmp.Or(h["title"], filepath.Base(h["path"])),
-			desc:  cmp.Or(h["artist"], "Unknown artist"),
-			path:  h["path"],
+			title:    cmp.Or(h["title"], filepath.Base(h["path"])),
+			desc:     cmp.Or(h["artist"], "Unknown artist"),
+			path:     h["path"],
+			duration: dur,
 		})
 	}
 	return items, nil
