@@ -8,6 +8,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/rivo/tview"
+	"github.com/sahilm/fuzzy"
 )
 
 // Catppuccin Mocha. Do not add shades that are not in this struct.
@@ -110,6 +111,10 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 	u.search.SetFieldBackgroundColor(mocha.Mantle).
 		SetFieldTextColor(mocha.Text).
 		SetLabelColor(mocha.Mauve)
+	u.search.SetChangedFunc(func(q string) { u.applyFilter(q) })
+	u.search.SetDoneFunc(func(key tcell.Key) {
+		u.closeSearch(key == tcell.KeyEscape)
+	})
 
 	u.body = tview.NewFlex().
 		AddItem(u.sidebar, 16, 0, false).
@@ -162,6 +167,81 @@ func (u *UI) setTracks(items []item) {
 
 func cell(s string, c tcell.Color) *tview.TableCell {
 	return tview.NewTableCell(s).SetTextColor(c)
+}
+
+// trackSource lets fuzzy match against title, artist and album at once.
+type trackSource []item
+
+func (t trackSource) Len() int            { return len(t) }
+func (t trackSource) String(i int) string { return t[i].title + " " + t[i].desc }
+
+// highlight wraps the runes at idx in mauve tview markup.
+func highlight(s string, idx []int) string {
+	if len(idx) == 0 {
+		return s
+	}
+	hit := make(map[int]bool, len(idx))
+	for _, i := range idx {
+		hit[i] = true
+	}
+	var b strings.Builder
+	on := false
+	for i, r := range []rune(s) {
+		switch {
+		case hit[i] && !on:
+			b.WriteString("[" + mocha.Mauve.String() + "::b]")
+			on = true
+		case !hit[i] && on:
+			b.WriteString("[-::-]")
+			on = false
+		}
+		b.WriteRune(r)
+	}
+	if on {
+		b.WriteString("[-::-]")
+	}
+	return b.String()
+}
+
+// applyFilter repaints the table with fuzzy matches, ranked by score.
+func (u *UI) applyFilter(query string) {
+	if query == "" {
+		u.table.SetTitle(" TRACKS ")
+		u.setTracks(u.all)
+		return
+	}
+
+	matches := fuzzy.FindFrom(query, trackSource(u.all))
+	u.shown = make([]item, 0, len(matches))
+	u.table.Clear()
+
+	u.paintTableHeader()
+
+	for row, m := range matches {
+		it := u.all[m.Index]
+		u.shown = append(u.shown, it)
+
+		// MatchedIndexes are positions in title+" "+artist; split at the title boundary.
+		var titleHits, artistHits []int
+		cut := len([]rune(it.title))
+		for _, i := range m.MatchedIndexes {
+			if i < cut {
+				titleHits = append(titleHits, i)
+			} else if i > cut {
+				artistHits = append(artistHits, i-cut-1)
+			}
+		}
+
+		u.table.SetCell(row+1, 0, cell(fmt.Sprintf("%d", row+1), mocha.Overlay0))
+		u.table.SetCell(row+1, 1, cell(highlight(it.title, titleHits), mocha.Text))
+		u.table.SetCell(row+1, 2, cell(highlight(it.desc, artistHits), mocha.Subtext0))
+		u.table.SetCell(row+1, 3, cell(fmtDuration(it.duration), mocha.Subtext0))
+	}
+
+	u.table.SetTitle(fmt.Sprintf(" TRACKS · search: %s ", query))
+	if len(u.shown) > 0 {
+		u.table.Select(1, 0)
+	}
 }
 
 func (u *UI) refreshHeader() {
@@ -325,6 +405,24 @@ func (u *UI) setFooter() {
 		m, m, m, m, m, m, m))
 }
 
+// openSearch replaces the footer row with the search field while active.
+func (u *UI) openSearch() {
+	u.root.RemoveItem(u.footer)
+	u.root.AddItem(u.search, 1, 0, true)
+	u.search.SetText("")
+	u.app.SetFocus(u.search)
+}
+
+// closeSearch restores the footer. clear also resets the filter (escape).
+func (u *UI) closeSearch(clear bool) {
+	u.root.RemoveItem(u.search)
+	u.root.AddItem(u.footer, 1, 0, false)
+	if clear {
+		u.applyFilter("")
+	}
+	u.app.SetFocus(u.table)
+}
+
 func (u *UI) bindKeys() {
 	u.table.SetSelectedFunc(func(row, _ int) { u.playRow(row - 1) })
 
@@ -332,6 +430,10 @@ func (u *UI) bindKeys() {
 		// Let the search field consume everything except escape.
 		if u.app.GetFocus() == u.search && ev.Key() != tcell.KeyEscape {
 			return ev
+		}
+		if ev.Key() == tcell.KeyEscape && u.app.GetFocus() == u.search {
+			u.closeSearch(true)
+			return nil
 		}
 		switch ev.Key() {
 		case tcell.KeyTab:
@@ -348,6 +450,9 @@ func (u *UI) bindKeys() {
 			return nil
 		}
 		switch ev.Rune() {
+		case '/':
+			u.openSearch()
+			return nil
 		case 'q':
 			u.app.Stop()
 			return nil

@@ -1,12 +1,13 @@
 module SEHO
 
-go 1.24.0
+go 1.24.5
 
 require (
 	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/gdamore/tcell/v2 v2.13.10
 	github.com/redis/go-redis/v9 v9.6.1
 	github.com/rivo/tview v0.42.0
+	github.com/sahilm/fuzzy v0.1.3
 )
 
 require (
