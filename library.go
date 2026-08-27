@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/list"
 	"github.com/dhowden/tag"
 	"github.com/redis/go-redis/v9"
 )
@@ -136,14 +135,14 @@ func indexFile(ctx context.Context, path string, rdb *redis.Client) (bool, error
 // listTracks returns every indexed track, ready for the TUI list.
 // ponytail: KEYS + one HGETALL per track. Fine for a personal library; switch to
 // SCAN and a pipeline if this ever holds more than a few thousand tracks.
-func listTracks(ctx context.Context, rdb *redis.Client) ([]list.Item, error) {
+func listTracks(ctx context.Context, rdb *redis.Client) ([]item, error) {
 	keys, err := rdb.Keys(ctx, keyPrefix+"*").Result()
 	if err != nil {
 		return nil, err
 	}
 	slices.Sort(keys)
 
-	items := make([]list.Item, 0, len(keys))
+	items := make([]item, 0, len(keys))
 	for _, k := range keys {
 		h, err := rdb.HGetAll(ctx, k).Result()
 		if err != nil {
