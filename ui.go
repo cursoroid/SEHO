@@ -68,10 +68,10 @@ type UI struct {
 	shown   []item // current table contents, and the play queue
 	playing int    // index into shown, -1 when nothing is playing
 
-	pos, dur            float64 // transport clock, seconds
-	paused              bool
-	vol                 int
-	nowTitle, nowArtist string
+	pos, dur                     float64 // transport clock, seconds
+	paused                       bool
+	vol                          int
+	nowTitle, nowArtist, nowPath string
 }
 
 func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
@@ -155,14 +155,15 @@ func (u *UI) setTracks(items []item) {
 
 	for i, it := range items {
 		u.table.SetCell(i+1, 0, cell(fmt.Sprintf("%d", i+1), mocha.Overlay0))
-		u.table.SetCell(i+1, 1, cell(it.title, mocha.Text))
-		u.table.SetCell(i+1, 2, cell(it.desc, mocha.Subtext0))
+		u.table.SetCell(i+1, 1, cell(tview.Escape(it.title), mocha.Text))
+		u.table.SetCell(i+1, 2, cell(tview.Escape(it.desc), mocha.Subtext0))
 		u.table.SetCell(i+1, 3, cell(fmtDuration(it.duration), mocha.Subtext0))
 	}
 	if len(items) > 0 {
 		u.table.Select(1, 0)
 	}
 	u.refreshHeader()
+	u.resyncPlaying(u.nowPath)
 }
 
 func cell(s string, c tcell.Color) *tview.TableCell {
@@ -175,8 +176,15 @@ type trackSource []item
 func (t trackSource) Len() int            { return len(t) }
 func (t trackSource) String(i int) string { return t[i].title + " " + t[i].desc }
 
-// highlight wraps the runes at idx in mauve tview markup.
+// highlight wraps the bytes at idx in mauve markup. idx are BYTE offsets into s
+// (that is what fuzzy.FindFrom returns).
+// ponytail: titles are user data and may contain "[...]", which tview eats as a
+// tag. Escaping shifts every offset, so a bracketed title gets correct text and
+// no highlighting rather than an offset-mapping machine for a cosmetic effect.
 func highlight(s string, idx []int) string {
+	if strings.ContainsRune(s, '[') {
+		return tview.Escape(s)
+	}
 	if len(idx) == 0 {
 		return s
 	}
@@ -186,7 +194,7 @@ func highlight(s string, idx []int) string {
 	}
 	var b strings.Builder
 	on := false
-	for i, r := range []rune(s) {
+	for i, r := range s { // byte index, matching fuzzy's offsets
 		switch {
 		case hit[i] && !on:
 			b.WriteString("[" + mocha.Mauve.String() + "::b]")
@@ -221,9 +229,9 @@ func (u *UI) applyFilter(query string) {
 		it := u.all[m.Index]
 		u.shown = append(u.shown, it)
 
-		// MatchedIndexes are positions in title+" "+artist; split at the title boundary.
+		// MatchedIndexes are BYTE positions in title+" "+artist; split at the title boundary.
 		var titleHits, artistHits []int
-		cut := len([]rune(it.title))
+		cut := len(it.title)
 		for _, i := range m.MatchedIndexes {
 			if i < cut {
 				titleHits = append(titleHits, i)
@@ -241,6 +249,22 @@ func (u *UI) applyFilter(query string) {
 	u.table.SetTitle(fmt.Sprintf(" TRACKS · search: %s ", query))
 	if len(u.shown) > 0 {
 		u.table.Select(1, 0)
+	}
+	u.resyncPlaying(u.nowPath)
+}
+
+// resyncPlaying re-points u.playing at the currently loaded track after u.shown
+// is rebuilt, or -1 when it is no longer visible.
+func (u *UI) resyncPlaying(path string) {
+	u.playing = -1
+	if path == "" {
+		return
+	}
+	for i, it := range u.shown {
+		if it.path == path {
+			u.playing = i
+			return
+		}
 	}
 }
 
@@ -263,7 +287,7 @@ func (u *UI) playRow(row int) {
 		return
 	}
 	u.playing = row
-	u.nowTitle, u.nowArtist = u.shown[row].title, u.shown[row].desc
+	u.nowTitle, u.nowArtist, u.nowPath = u.shown[row].title, u.shown[row].desc, u.shown[row].path
 	u.pos, u.dur = 0, u.shown[row].duration
 	if err := u.pl.Load(u.shown[row].path); err != nil {
 		u.setStatus(fmt.Sprintf("[%s]playback failed: %v", mocha.Red.String(), err))
@@ -324,8 +348,8 @@ func (u *UI) drawTransport() {
 	}
 	line1 := fmt.Sprintf("  [%s]%s[-]  [%s::b]%s[-::-] [%s]· %s%*s[%s]vol %s %d%%",
 		iconColor.String(), icon,
-		mocha.Text.String(), title,
-		mocha.Subtext0.String(), u.nowArtist, 4, "",
+		mocha.Text.String(), tview.Escape(title),
+		mocha.Subtext0.String(), tview.Escape(u.nowArtist), 4, "",
 		mocha.Subtext0.String(), volMeter(u.vol), u.vol)
 
 	frac := 0.0
@@ -367,6 +391,14 @@ func (u *UI) pumpEvents() {
 				// Backfill tracks indexed without ffprobe.
 				if u.playing >= 0 && u.playing < len(u.shown) && u.shown[u.playing].duration <= 0 {
 					u.shown[u.playing].duration = ev.Num
+					// u.shown may be a filtered copy of u.all (applyFilter), so the
+					// write above would not otherwise reach the backing library data.
+					for i := range u.all {
+						if u.all[i].path == u.shown[u.playing].path {
+							u.all[i].duration = ev.Num
+							break
+						}
+					}
 					go backfillDuration(context.Background(), u.rdb, u.shown[u.playing].path, ev.Num)
 				}
 			case "pause":
