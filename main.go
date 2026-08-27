@@ -33,7 +33,7 @@ type model struct {
 	list     list.Model
 	rdb      *redis.Client
 	dir      string
-	player   *player
+	player   *Player
 	status   string
 	browsing bool
 }
@@ -53,7 +53,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
-			m.player.stop()
+			m.player.Stop()
 			return m, tea.Quit
 		case "esc":
 			if m.browsing {
@@ -65,7 +65,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			if m.browsing {
-				if err := m.player.play(sel.path); err != nil {
+				if err := m.player.Load(sel.path); err != nil {
 					m.status = fmt.Sprintf("Playback failed: %v", err)
 				} else {
 					m.status = "Playing: " + sel.title
@@ -110,12 +110,12 @@ func (m model) menuAction(title string) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "Stop Playback":
-		m.player.stop()
+		m.player.Stop()
 		m.status = "Stopped"
 		return m, nil
 
 	case "Quit":
-		m.player.stop()
+		m.player.Stop()
 		return m, tea.Quit
 	}
 	return m, nil
@@ -177,7 +177,14 @@ func main() {
 	l := list.New(menu, list.NewDefaultDelegate(), 0, 0)
 	l.Title = "SEHO"
 
-	m := model{list: l, rdb: rdb, dir: dir, player: &player{}}
+	pl, err := StartPlayer()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer pl.Close()
+
+	m := model{list: l, rdb: rdb, dir: dir, player: pl}
 	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
