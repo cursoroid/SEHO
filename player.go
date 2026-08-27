@@ -15,14 +15,24 @@ import (
 
 // Event is one state change pushed from mpv toward the UI.
 // Name is an mpv property name, or the literal "end-file".
+// Reason is populated only for "end-file" (mpv's end-file reason, e.g. "error"
+// when a track failed to load) and is empty for every other event.
 type Event struct {
-	Name string
-	Num  float64
-	Flag bool
+	Name   string
+	Num    float64
+	Flag   bool
+	Reason string
 }
 
 // observed maps our fixed observer IDs to mpv property names.
 var observed = map[int]string{1: "time-pos", 2: "duration", 3: "pause", 4: "volume"}
+
+// mpvReply is one command reply as delivered to the waiting caller of send():
+// the raw data payload plus mpv's error string ("success" when it worked).
+type mpvReply struct {
+	data json.RawMessage
+	err  string
+}
 
 type Player struct {
 	cmd  *exec.Cmd
@@ -31,7 +41,7 @@ type Player struct {
 
 	mu      sync.Mutex
 	nextID  int
-	pending map[int]chan json.RawMessage
+	pending map[int]chan mpvReply
 
 	events chan Event
 	closed chan struct{}
@@ -58,18 +68,21 @@ func StartPlayer() (*Player, error) {
 		return nil, fmt.Errorf("start mpv: %w", err)
 	}
 
-	p, err := dialPlayer(sock)
+	p, err := dialPlayer(sock, cmd)
 	if err != nil {
 		cmd.Process.Kill()
+		cmd.Wait()
 		return nil, err
 	}
-	p.cmd = cmd
 	return p, nil
 }
 
 // dialPlayer attaches to an mpv IPC socket that already exists, retrying while
-// mpv finishes creating it.
-func dialPlayer(sock string) (*Player, error) {
+// mpv finishes creating it. cmd is the mpv process to associate with the
+// resulting Player (nil in tests, which dial a fake mpv directly) so that a
+// failure during observer registration below reaps it via Close() rather than
+// leaking it.
+func dialPlayer(sock string, cmd *exec.Cmd) (*Player, error) {
 	var conn net.Conn
 	var err error
 	for i := 0; i < 100; i++ {
@@ -84,9 +97,10 @@ func dialPlayer(sock string) (*Player, error) {
 	}
 
 	p := &Player{
+		cmd:     cmd,
 		conn:    conn,
 		sock:    sock,
-		pending: map[int]chan json.RawMessage{},
+		pending: map[int]chan mpvReply{},
 		events:  make(chan Event, 64),
 		closed:  make(chan struct{}),
 	}
@@ -125,7 +139,7 @@ func (p *Player) readLoop() {
 		case msg.Event == "property-change":
 			p.emit(Event{Name: msg.Name, Num: asFloat(msg.Data), Flag: asBool(msg.Data)})
 		case msg.Event == "end-file":
-			p.emit(Event{Name: "end-file"})
+			p.emit(Event{Name: "end-file", Reason: msg.Reason})
 		case msg.Event != "":
 			// Other mpv events are not used by the UI.
 		default:
@@ -134,7 +148,7 @@ func (p *Player) readLoop() {
 			delete(p.pending, msg.RequestID)
 			p.mu.Unlock()
 			if ok {
-				ch <- msg.Data
+				ch <- mpvReply{data: msg.Data, err: msg.Error}
 			}
 		}
 	}
@@ -149,12 +163,13 @@ func (p *Player) emit(ev Event) {
 	}
 }
 
-// send writes one command and waits for its reply.
+// send writes one command and waits for its reply, returning an error both
+// when mpv never answers and when it answers with error != "success".
 func (p *Player) send(args ...any) error {
 	p.mu.Lock()
 	p.nextID++
 	id := p.nextID
-	ch := make(chan json.RawMessage, 1)
+	ch := make(chan mpvReply, 1)
 	p.pending[id] = ch
 	p.mu.Unlock()
 
@@ -167,7 +182,10 @@ func (p *Player) send(args ...any) error {
 	}
 
 	select {
-	case <-ch:
+	case r := <-ch:
+		if r.err != "" && r.err != "success" {
+			return fmt.Errorf("mpv: %s", r.err)
+		}
 		return nil
 	case <-time.After(2 * time.Second):
 		p.mu.Lock()
