@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/redis/go-redis/v9"
@@ -65,6 +66,11 @@ type UI struct {
 	all     []item // everything in the library
 	shown   []item // current table contents, and the play queue
 	playing int    // index into shown, -1 when nothing is playing
+
+	pos, dur            float64 // transport clock, seconds
+	paused              bool
+	vol                 int
+	nowTitle, nowArtist string
 }
 
 func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
@@ -177,11 +183,83 @@ func (u *UI) playRow(row int) {
 		return
 	}
 	u.playing = row
+	u.nowTitle, u.nowArtist = u.shown[row].title, u.shown[row].desc
+	u.pos, u.dur = 0, u.shown[row].duration
 	if err := u.pl.Load(u.shown[row].path); err != nil {
 		u.setStatus(fmt.Sprintf("[%s]playback failed: %v", mocha.Red.String(), err))
 		return
 	}
 	u.table.Select(row+1, 0)
+}
+
+// progressBar renders a width-cell bar. Exactly width runes of content,
+// with a knob at the boundary.
+func progressBar(frac float64, width int) string {
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	fill := int(frac*float64(width) + 0.5)
+	knob := ""
+	if fill > 0 && fill < width {
+		knob = "●"
+	}
+	body := strings.Repeat("━", fill)
+	if knob != "" {
+		body = strings.Repeat("━", fill-1) + knob
+	}
+	return fmt.Sprintf("[%s]%s[%s]%s",
+		mocha.Mauve.String(), body,
+		mocha.Surface1.String(), strings.Repeat("─", width-fill))
+}
+
+func volMeter(v int) string {
+	bars := []rune("▁▃▅▇")
+	n := v * len(bars) / 130
+	out := make([]rune, 0, len(bars))
+	for i := range bars {
+		if i < n {
+			out = append(out, bars[i])
+		} else {
+			out = append(out, '·')
+		}
+	}
+	return string(out)
+}
+
+func (u *UI) drawTransport() {
+	icon, iconColor := "▶", mocha.Green
+	if u.paused {
+		icon, iconColor = "⏸", mocha.Red
+	}
+	if u.nowTitle == "" {
+		icon, iconColor = "■", mocha.Overlay0
+	}
+
+	title := u.nowTitle
+	if title == "" {
+		title = "nothing playing"
+	}
+	line1 := fmt.Sprintf("  [%s]%s[-]  [%s::b]%s[-::-] [%s]· %s%*s[%s]vol %s %d%%",
+		iconColor.String(), icon,
+		mocha.Text.String(), title,
+		mocha.Subtext0.String(), u.nowArtist, 4, "",
+		mocha.Subtext0.String(), volMeter(u.vol), u.vol)
+
+	frac := 0.0
+	if u.dur > 0 {
+		frac = u.pos / u.dur
+	}
+	_, _, w, _ := u.transport.GetInnerRect()
+	barWidth := max(10, w-24)
+	line2 := fmt.Sprintf("  [%s]%s [-]%s[%s] %s",
+		mocha.Subtext0.String(), fmtDuration(u.pos),
+		progressBar(frac, barWidth),
+		mocha.Subtext0.String(), fmtDuration(u.dur))
+
+	u.transport.SetText(line1 + "\n" + line2)
 }
 
 func (u *UI) setStatus(markup string) { u.transport.SetText("  " + markup) }
@@ -196,17 +274,55 @@ func (u *UI) reload() {
 	u.setTracks(items)
 }
 
+// pumpEvents forwards mpv state onto the UI goroutine. Runs for the app's life.
+func (u *UI) pumpEvents() {
+	for ev := range u.pl.Events() {
+		ev := ev
+		u.app.QueueUpdateDraw(func() {
+			switch ev.Name {
+			case "time-pos":
+				u.pos = ev.Num
+			case "duration":
+				u.dur = ev.Num
+				// Backfill tracks indexed without ffprobe.
+				if u.playing >= 0 && u.playing < len(u.shown) && u.shown[u.playing].duration <= 0 {
+					u.shown[u.playing].duration = ev.Num
+					go backfillDuration(context.Background(), u.rdb, u.shown[u.playing].path, ev.Num)
+				}
+			case "pause":
+				u.paused = ev.Flag
+			case "volume":
+				u.vol = int(ev.Num)
+			case "end-file":
+				u.pos = 0
+				if ev.Reason == "error" {
+					u.setStatus(fmt.Sprintf("[%s]could not play %s", mocha.Red.String(), u.nowTitle))
+					return
+				}
+			case "disconnected":
+				u.setStatus(fmt.Sprintf("[%s]lost connection to mpv", mocha.Red.String()))
+				return
+			}
+			u.drawTransport()
+		})
+	}
+}
+
 func (u *UI) Run() error {
 	u.reload()
 	u.setFooter()
 	u.bindKeys()
+	u.vol = 100
+	go u.pumpEvents()
+	u.drawTransport()
 	return u.app.Run()
 }
 
 func (u *UI) setFooter() {
-	u.footer.SetText(fmt.Sprintf("  [%s]/[-] search  [%s]enter[-] play  [%s]tab[-] pane  [%s]s[-] scan  [%s]q[-] quit",
-		mocha.Mauve.String(), mocha.Mauve.String(), mocha.Mauve.String(),
-		mocha.Mauve.String(), mocha.Mauve.String()))
+	m := mocha.Mauve.String()
+	u.footer.SetText(fmt.Sprintf(
+		"  [%s]/[-] search  [%s]space[-] pause  [%s]←→[-] seek  [%s]n/p[-] track  [%s]-/=[-] vol  [%s]s[-] scan  [%s]q[-] quit",
+		m, m, m, m, m, m, m))
 }
 
 func (u *UI) bindKeys() {
@@ -224,6 +340,12 @@ func (u *UI) bindKeys() {
 		case tcell.KeyBacktab:
 			u.cycleFocus(-1)
 			return nil
+		case tcell.KeyLeft:
+			u.pl.Seek(-5)
+			return nil
+		case tcell.KeyRight:
+			u.pl.Seek(5)
+			return nil
 		}
 		switch ev.Rune() {
 		case 'q':
@@ -231,6 +353,23 @@ func (u *UI) bindKeys() {
 			return nil
 		case 's':
 			go u.scan()
+			return nil
+		case ' ':
+			u.pl.TogglePause()
+			return nil
+		case 'n':
+			u.playRow(u.playing + 1)
+			return nil
+		case 'p':
+			u.playRow(u.playing - 1)
+			return nil
+		case '-':
+			u.vol -= 5
+			u.pl.SetVolume(u.vol)
+			return nil
+		case '=':
+			u.vol += 5
+			u.pl.SetVolume(u.vol)
 			return nil
 		}
 		return ev
