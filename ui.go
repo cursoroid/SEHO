@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/redis/go-redis/v9"
@@ -29,9 +30,14 @@ type UI struct {
 	// user who never touches Spotify never spawns librespot. active says which
 	// one owns the transport - events from the other are ignored.
 	local  *Player
-	spot   *SpotifyBackend
 	api    *Spotify
 	active source
+
+	// spot is created lazily and read from both the UI goroutine and the
+	// goroutine that starts it, so every access goes through spotMu. It is one
+	// pointer, so one mutex is the whole story - see spotify().
+	spot   *SpotifyBackend
+	spotMu sync.Mutex
 
 	// eq is the live profile. It may differ from the saved one while the sound
 	// page is open, which is what makes auditioning a curve possible.
@@ -573,19 +579,19 @@ func (u *UI) refreshHeader() {
 	u.header.SetText(strings.Join(rows, "\n"))
 }
 
-// backendFor returns the backend that plays items from src, creating the
-// Spotify one on first use.
-func (u *UI) backendFor(src source) (Backend, error) {
-	if src == srcLocal {
-		return u.local, nil
-	}
-	return u.ensureSpotify()
+// spotify returns the Spotify backend, or nil when it has not been started.
+func (u *UI) spotify() *SpotifyBackend {
+	u.spotMu.Lock()
+	defer u.spotMu.Unlock()
+	return u.spot
 }
 
 // current is the backend that owns the transport right now.
 func (u *UI) current() Backend {
-	if u.active == srcSpotify && u.spot != nil {
-		return u.spot
+	if u.active == srcSpotify {
+		if sp := u.spotify(); sp != nil {
+			return sp
+		}
 	}
 	return u.local
 }
@@ -595,15 +601,22 @@ func (u *UI) stopOther(next source) {
 	switch {
 	case next == srcSpotify && u.local != nil:
 		u.local.Stop()
-	case next == srcLocal && u.spot != nil:
-		u.spot.Stop()
+	case next == srcLocal:
+		if sp := u.spotify(); sp != nil {
+			sp.Stop()
+		}
 	}
 }
 
 // ensureSpotify starts librespot and its mpv instance on first Spotify play.
-// It is deliberately lazy: spawning librespot at startup would demand a login
-// from someone who only ever wanted to play their own files.
-func (u *UI) ensureSpotify() (Backend, error) {
+// Lazy on purpose: spawning librespot at startup would demand a login from
+// someone who only ever wanted to play their own files.
+//
+// Never call this from the UI goroutine - it spawns processes and may refresh
+// an OAuth token over the network. startSpotifyTrack is the entry point.
+func (u *UI) ensureSpotify() (*SpotifyBackend, error) {
+	u.spotMu.Lock()
+	defer u.spotMu.Unlock()
 	if u.spot != nil {
 		return u.spot, nil
 	}
@@ -622,8 +635,37 @@ func (u *UI) ensureSpotify() (Backend, error) {
 	u.spot = sp
 	go u.pumpEvents(srcSpotify, sp.Events())
 	sp.SetVolume(u.vol)
-	u.applyEQ()
+	sp.SetAF(u.eqChain())
 	return sp, nil
+}
+
+// startSpotifyTrack runs the slow half of a Spotify play off the UI goroutine:
+// starting librespot, waiting for its session (which on a first run waits for a
+// human in a browser) and asking Spotify to play. Doing this inline would
+// freeze the whole interface for as long as the login takes.
+func (u *UI) startSpotifyTrack(uri, title string) {
+	sp, err := u.ensureSpotify()
+	if err != nil {
+		u.app.QueueUpdateDraw(func() { u.setStatus(errMarkup(err.Error())) })
+		return
+	}
+
+	u.app.QueueUpdateDraw(func() {
+		u.setStatus(fmt.Sprintf("[%s]starting %s on Spotify...",
+			mocha.Subtext0.String(), tview.Escape(title)))
+	})
+
+	if err := sp.Load(uri); err != nil {
+		u.app.QueueUpdateDraw(func() { u.setStatus(errMarkup("spotify playback: " + err.Error())) })
+		return
+	}
+	u.app.QueueUpdateDraw(func() {
+		// The transport takes over from here; clear the interim message only if
+		// this track is still the one the user is waiting on.
+		if u.nowPath == uri {
+			u.drawTransport()
+		}
+	})
 }
 
 func (u *UI) playRow(row int) {
@@ -635,11 +677,6 @@ func (u *UI) playRow(row int) {
 		return
 	}
 	it := u.shown[row]
-	b, err := u.backendFor(it.src)
-	if err != nil {
-		u.setStatus(errMarkup(err.Error()))
-		return
-	}
 
 	// Only one source plays at a time, and they are separate processes, so the
 	// outgoing one has to be told explicitly - otherwise a Spotify track starts
@@ -647,20 +684,27 @@ func (u *UI) playRow(row int) {
 	if it.src != u.active {
 		u.stopOther(it.src)
 		u.active = it.src
-		b.SetVolume(u.vol)
-		u.applyEQ()
 	}
 
 	u.playing = row
 	u.nowTitle, u.nowArtist, u.nowPath = it.title, it.desc, it.path
 	u.pos, u.dur = 0, it.duration
-	if err := b.Load(it.path); err != nil {
-		u.setStatus(errMarkup("playback failed: " + err.Error()))
-		return
-	}
 	u.table.Select(row+1, 0)
 	u.repaintMarkers()
 	u.drawCard(it)
+
+	if it.src == srcSpotify {
+		// Off the UI goroutine: this can wait on a librespot login.
+		go u.startSpotifyTrack(it.path, it.title)
+		return
+	}
+
+	u.local.SetVolume(u.vol)
+	u.local.SetAF(u.eqChain())
+	if err := u.local.Load(it.path); err != nil {
+		u.setStatus(errMarkup("playback failed: " + err.Error()))
+		return
+	}
 }
 
 // repaintMarkers refreshes the playing indicator and row colour in place.
@@ -1032,6 +1076,17 @@ func (u *UI) pumpEvents(src source, events <-chan Event) {
 				case "eof":
 					u.advance()
 				}
+			case "audio-key-refused":
+				// Spotify refused the decryption key. Do not advance: every
+				// track fails the same way for an affected account, and walking
+				// the queue would just spin through the whole list.
+				u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
+				u.playing = -1
+				u.paused = false
+				u.drawCard(item{})
+				u.setStatus(errMarkup("Spotify refused the decryption key - a known block on newer " +
+					"Spotify accounts (librespot issue 1649). Local files are unaffected."))
+				return
 			case "disconnected":
 				u.setStatus(errMarkup("lost connection to mpv"))
 				return
@@ -1051,8 +1106,8 @@ func (u *UI) Run() error {
 	go u.pumpEvents(srcLocal, u.local.Events())
 	u.drawTransport()
 	err := u.app.Run()
-	if u.spot != nil {
-		u.spot.Close()
+	if sp := u.spotify(); sp != nil {
+		sp.Close()
 	}
 	return err
 }

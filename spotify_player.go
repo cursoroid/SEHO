@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -26,18 +27,54 @@ import (
 // Transport commands go to the Spotify Web API (librespot is a Connect device
 // and takes its orders from Spotify, not from us), while volume and the filter
 // chain go to mpv, which is where the audio actually passes through.
+// attempt tracks one librespot spawn. failed closes when librespot rejects the
+// credentials, cannot register as a Connect device, or exits before it gets
+// there.
+//
+// There is deliberately no "ready" signal any more. An earlier version treated
+// the log line "Authenticated as ..." as readiness, which is wrong: with a
+// stale credential librespot authenticates its session and is then refused at
+// spirc ("could not initialize spirc: Login request was denied"), so it looks
+// ready and never becomes a device. The only trustworthy readiness test is
+// Spotify listing the device, so that is what Load waits for.
+type attempt struct {
+	failed   chan struct{}
+	failOnce sync.Once
+	reason   string // librespot's own words, for the error the user sees
+	oauth    bool   // this spawn took the interactive login path
+}
+
+func newAttempt(oauth bool) *attempt {
+	return &attempt{failed: make(chan struct{}), oauth: oauth}
+}
+
+func (a *attempt) markFailed(reason string) {
+	a.failOnce.Do(func() {
+		a.reason = reason
+		close(a.failed)
+	})
+}
+
 type SpotifyBackend struct {
-	api    *Spotify
-	mpv    *Player
-	cmd    *exec.Cmd
-	fifo   string
-	hold   *os.File // dummy writer: see StartSpotifyBackend
-	cache  string
-	device string // librespot's advertised name
+	api      *Spotify
+	mpv      *Player
+	cmd      *exec.Cmd
+	fifo     string
+	hold     *os.File // dummy writer: see StartSpotifyBackend
+	cache    string
+	device   string // librespot's advertised name
+	cfg      Config // kept for a respawn when cached credentials turn out stale
+	announce func(string)
 
 	events chan Event
 	closed chan struct{}
 	once   sync.Once
+
+	// att is the current spawn attempt's signals. Each spawn gets a fresh one so
+	// a dying process can only ever report about its own attempt - resetting
+	// shared channels let an old librespot's exit fail the retry that replaced
+	// it.
+	att atomic.Pointer[attempt]
 
 	mu       sync.Mutex
 	deviceID string
@@ -59,10 +96,23 @@ const pollInterval = time.Second
 // update would make it lurch instead of glide.
 const tickInterval = 100 * time.Millisecond
 
-// oauthURLRe finds the login URL librespot prints when it needs interactive
-// sign-in. librespot writes it as human-readable log text, so this is
-// deliberately loose about the surrounding words.
-var oauthURLRe = regexp.MustCompile(`https://accounts\.spotify\.com/\S*authorize\S*`)
+// Patterns matched against librespot's log. It has no machine-readable status
+// output, so its own words are the only signal available.
+var (
+	// oauthURLRe finds the login URL it prints when it needs interactive sign-in.
+	oauthURLRe = regexp.MustCompile(`https://accounts\.spotify\.com/\S*authorize\S*`)
+	// audioKeyRe marks Spotify refusing the decryption key for a track. Since
+	// librespot 0.7 Spotify has withheld audio keys from newer accounts whatever
+	// the login method (librespot-org/librespot#1649): the session authenticates,
+	// the device registers, playback is accepted, and then every track skips.
+	// Nothing here can fix that, so the least SEHO can do is say so instead of
+	// leaving a transport bar creeping along in silence.
+	audioKeyRe = regexp.MustCompile(`(?i)error audio key|unable to load key`)
+	// authFailRe marks credentials librespot will not accept. Spotify's own
+	// wording is INVALID_CREDENTIALS inside "Login request was denied", so the
+	// separator has to be optional - a space-only pattern misses it.
+	authFailRe = regexp.MustCompile(`(?i)(bad|invalid)[ _-]?credentials|login request was denied|login failed|credentials are required|authentication failed|could not initialize spirc`)
+)
 
 // StartSpotifyBackend spawns librespot and the mpv instance that consumes its
 // output. announce is called with librespot's OAuth URL when it needs an
@@ -102,14 +152,16 @@ func StartSpotifyBackend(api *Spotify, cfg Config, announce func(string)) (*Spot
 	}
 
 	s := &SpotifyBackend{
-		api:    api,
-		mpv:    mpv,
-		fifo:   fifo,
-		hold:   hold,
-		cache:  filepath.Join(configDir(), "librespot"),
-		device: cfg.DeviceName,
-		events: make(chan Event, 64),
-		closed: make(chan struct{}),
+		api:      api,
+		mpv:      mpv,
+		fifo:     fifo,
+		hold:     hold,
+		cache:    filepath.Join(configDir(), "librespot"),
+		device:   cfg.DeviceName,
+		cfg:      cfg,
+		announce: announce,
+		events:   make(chan Event, 64),
+		closed:   make(chan struct{}),
 	}
 
 	if err := s.spawnLibrespot(cfg, announce); err != nil {
@@ -122,16 +174,24 @@ func StartSpotifyBackend(api *Spotify, cfg Config, announce func(string)) (*Spot
 	return s, nil
 }
 
-// spawnLibrespot starts librespot as a Connect device. Interactive OAuth is
-// requested only when no cached credential exists, so this is a one-time
-// browser trip rather than something every launch drags the user through.
+// spawnLibrespot starts librespot as a Connect device, using its cached
+// credentials when it has them and its own interactive OAuth when it does not.
+// The credential is cached under --system-cache afterwards, so the browser trip
+// happens once per machine.
 //
-// ponytail: librespot 0.8 also accepts --access-token, which could reuse the
-// token SEHO already holds and remove this second login entirely. It is not
-// used yet because a PKCE token from a third-party client id is not guaranteed
-// to carry streaming rights, and a silent auth failure at spawn time is worse
-// UX than one extra browser tab. Revisit if Spotify documents it as supported.
+// Ruling, with evidence: librespot 0.8's --access-token, fed SEHO's own PKCE
+// token (with the streaming scope requested), is rejected by Spotify -
+// "could not initialize spirc: Login request was denied: INVALID_CREDENTIALS".
+// A third-party client's token cannot open a librespot session, so the two
+// logins are not an oversight to be tidied away later; they are what Spotify
+// permits. Do not re-plumb --access-token without new evidence from upstream.
 func (s *SpotifyBackend) spawnLibrespot(cfg Config, announce func(string)) error {
+	return s.spawnWith(cfg, announce, false)
+}
+
+// spawnWith builds the command line. forceOAuth skips the token and goes
+// straight to librespot's interactive login.
+func (s *SpotifyBackend) spawnWith(cfg Config, announce func(string), forceOAuth bool) error {
 	if err := os.MkdirAll(s.cache, 0o700); err != nil {
 		return err
 	}
@@ -156,17 +216,24 @@ func (s *SpotifyBackend) spawnLibrespot(cfg Config, announce func(string)) error
 		"--volume-ctrl", "fixed",
 		"--initial-volume", "100",
 	}
-	if !s.hasCachedCredentials() {
+	oauth := forceOAuth || !s.hasCachedCredentials()
+	if oauth {
 		args = append(args, "--enable-oauth")
 	}
+	att := newAttempt(oauth)
+	s.att.Store(att)
 
 	cmd := exec.Command("librespot", args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return err
 	}
-	// librespot prints its OAuth URL on stdout in some builds and stderr in
-	// others; watch both rather than guessing.
+	// Both streams are scanned: librespot logs to stderr, but its OAuth URL is a
+	// plain println on stdout. Audio never lands there as long as --device names
+	// the fifo, which it always does above - the pipe sink only falls back to
+	// stdout when no device is given. ("Using StdoutSink (pipe)" is logged either
+	// way; the file is opened lazily in the sink's start(), so that line says
+	// nothing about which target is in use.)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -176,9 +243,30 @@ func (s *SpotifyBackend) spawnLibrespot(cfg Config, announce func(string)) error
 	}
 	s.cmd = cmd
 
-	go s.watchOutput(stderr, announce)
-	go s.watchOutput(stdout, announce)
+	go s.watchOutput(att, stderr, announce)
+	go s.watchOutput(att, stdout, announce)
+
+	// A librespot that dies before it authenticates must not leave Load waiting
+	// out its whole timeout: its exit is the answer.
+	go func(c *exec.Cmd, att *attempt) {
+		err := c.Wait()
+		log.Printf("librespot exited: %v", err)
+		att.markFailed(fmt.Sprintf("librespot exited: %v", err))
+	}(cmd, att)
 	return nil
+}
+
+// retryWithOAuth restarts librespot on its own interactive login. Reached when
+// cached credentials are stale - Spotify does revoke them - which would
+// otherwise leave Spotify permanently broken with no way back but deleting a
+// cache directory by hand.
+func (s *SpotifyBackend) retryWithOAuth(cfg Config, announce func(string)) error {
+	if s.cmd != nil && s.cmd.Process != nil {
+		s.cmd.Process.Kill()
+		s.cmd.Wait()
+	}
+	log.Print("librespot refused the access token; falling back to its own OAuth login")
+	return s.spawnWith(cfg, announce, true)
 }
 
 // hasCachedCredentials reports whether librespot already holds a session, so a
@@ -190,7 +278,7 @@ func (s *SpotifyBackend) hasCachedCredentials() bool {
 
 // watchOutput mirrors librespot's log into SEHO's log file and lifts out the
 // OAuth URL when one appears.
-func (s *SpotifyBackend) watchOutput(r io.Reader, announce func(string)) {
+func (s *SpotifyBackend) watchOutput(att *attempt, r io.Reader, announce func(string)) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 16*1024), 256*1024)
 	for sc.Scan() {
@@ -201,6 +289,12 @@ func (s *SpotifyBackend) watchOutput(r io.Reader, announce func(string)) {
 				announce(u)
 			}
 			openBrowser(u)
+		}
+		switch {
+		case authFailRe.MatchString(line):
+			att.markFailed(line)
+		case audioKeyRe.MatchString(line):
+			s.emit(Event{Name: "audio-key-refused"})
 		}
 	}
 }
@@ -215,10 +309,46 @@ func (s *SpotifyBackend) emit(ev Event) {
 	}
 }
 
-// resolveDevice finds librespot among the account's Connect devices. It retries
-// because registration takes a moment after the process starts, and on a first
-// run it cannot finish at all until the user completes the OAuth trip.
-func (s *SpotifyBackend) resolveDevice(ctx context.Context) (string, error) {
+// session returns the Connect device id for our librespot, which is the only
+// proof that it actually signed in. On a first run the wait includes however
+// long the user takes in the browser, so the budget comes from ctx rather than
+// a fixed retry count.
+//
+// A refused credential is recoverable exactly once: the cached credential is
+// deleted and librespot is restarted on its own interactive login. Without that
+// a single stale cache file would leave Spotify permanently broken with no way
+// back but deleting a directory by hand.
+func (s *SpotifyBackend) session(ctx context.Context) (string, error) {
+	for round := 0; round < 2; round++ {
+		att := s.att.Load()
+		if att == nil {
+			return "", errors.New("librespot was never started")
+		}
+
+		id, err := s.waitForDevice(ctx, att)
+		if err == nil {
+			return id, nil
+		}
+		if !errors.Is(err, errLibrespotAuth) || att.oauth || round == 1 {
+			return "", err
+		}
+
+		// Cached credential refused: clear it and sign in properly.
+		os.Remove(filepath.Join(s.cache, "credentials.json"))
+		if err := s.retryWithOAuth(s.cfg, s.announce); err != nil {
+			return "", err
+		}
+	}
+	return "", errors.New("librespot could not sign in to Spotify")
+}
+
+// errLibrespotAuth marks a credential problem, the one failure worth retrying
+// differently.
+var errLibrespotAuth = errors.New("librespot credentials refused")
+
+// waitForDevice polls Spotify's device list until our librespot appears, or
+// until this attempt reports that it never will.
+func (s *SpotifyBackend) waitForDevice(ctx context.Context, att *attempt) (string, error) {
 	s.mu.Lock()
 	id := s.deviceID
 	s.mu.Unlock()
@@ -226,33 +356,34 @@ func (s *SpotifyBackend) resolveDevice(ctx context.Context) (string, error) {
 		return id, nil
 	}
 
-	var lastErr error
-	for i := 0; i < 20; i++ {
-		d, err := s.api.DeviceByName(ctx, s.device)
-		if err == nil {
+	for {
+		if d, err := s.api.DeviceByName(ctx, s.device); err == nil {
 			s.mu.Lock()
 			s.deviceID = d.ID
 			s.mu.Unlock()
 			return d.ID, nil
 		}
-		lastErr = err
+
 		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
+		case <-time.After(time.Second):
+		case <-att.failed:
+			return "", fmt.Errorf("%w: %s", errLibrespotAuth, att.reason)
 		case <-s.closed:
 			return "", errors.New("spotify backend closed")
-		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+			return "", errors.New("librespot did not register as a Spotify device in time")
 		}
 	}
-	return "", fmt.Errorf("librespot never appeared as a Spotify device: %w", lastErr)
 }
 
 // Load plays one Spotify track URI on our librespot device.
 func (s *SpotifyBackend) Load(uri string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// Three minutes covers a first run where the user has to approve a login in
+	// the browser; afterwards this is reached in under a second.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	id, err := s.resolveDevice(ctx)
+	id, err := s.session(ctx)
 	if err != nil {
 		return err
 	}

@@ -35,7 +35,9 @@ const (
 
 	// user-read-playback-state and user-modify-playback-state drive the
 	// transport; user-library-read and playlist-read-private drive browsing.
-	// Nothing here grants write access to the library.
+	// Nothing here grants write access to the library, and nothing asks for
+	// more than SEHO uses - the streaming scope was tried and dropped, see
+	// spawnLibrespot for why it bought nothing.
 	spotifyScopes = "user-read-playback-state user-modify-playback-state user-library-read playlist-read-private"
 )
 
@@ -488,6 +490,9 @@ type playlist struct {
 func (s *Spotify) Playlists(ctx context.Context) ([]playlist, error) {
 	var lists []playlist
 	for offset := 0; ; offset += 50 {
+		// The count lives under "items" on current responses and under "tracks"
+		// on older ones; Spotify renamed it, so both are read and whichever is
+		// present wins. Getting this wrong shows every playlist as empty.
 		var out struct {
 			Items []struct {
 				ID    string `json:"id"`
@@ -495,6 +500,9 @@ func (s *Spotify) Playlists(ctx context.Context) ([]playlist, error) {
 				Owner struct {
 					DisplayName string `json:"display_name"`
 				} `json:"owner"`
+				ItemCount struct {
+					Total int `json:"total"`
+				} `json:"items"`
 				Tracks struct {
 					Total int `json:"total"`
 				} `json:"tracks"`
@@ -508,8 +516,12 @@ func (s *Spotify) Playlists(ctx context.Context) ([]playlist, error) {
 			return lists, err
 		}
 		for _, e := range out.Items {
+			total := e.ItemCount.Total
+			if total == 0 {
+				total = e.Tracks.Total
+			}
 			lists = append(lists, playlist{
-				ID: e.ID, Name: e.Name, Owner: e.Owner.DisplayName, Tracks: e.Tracks.Total,
+				ID: e.ID, Name: e.Name, Owner: e.Owner.DisplayName, Tracks: total,
 			})
 		}
 		if out.Next == "" || len(out.Items) == 0 {
@@ -519,27 +531,38 @@ func (s *Spotify) Playlists(ctx context.Context) ([]playlist, error) {
 	return lists, nil
 }
 
-// PlaylistTracks returns a playlist's tracks. Episodes and unavailable entries
-// come back from Spotify as tracks with an empty URI; they are dropped rather
-// than shown as unplayable rows.
+// PlaylistTracks returns a playlist's tracks.
+//
+// The endpoint is /items, not /tracks: /tracks answers 403 Forbidden now, and
+// each entry carries the track under "item" rather than "track" (verified
+// against the live API on 2026-08-28). Both key names are decoded so a rollback
+// on Spotify's side does not empty every playlist.
+//
+// Episodes, local files and unavailable entries have no spotify:track: URI and
+// are dropped rather than shown as rows that cannot play.
 func (s *Spotify) PlaylistTracks(ctx context.Context, id string, limit int) ([]item, error) {
 	var items []item
 	for offset := 0; offset < limit; offset += 100 {
 		var out struct {
 			Items []struct {
+				Item  apiTrack `json:"item"`
 				Track apiTrack `json:"track"`
 			} `json:"items"`
 			Next string `json:"next"`
 		}
-		path := "/playlists/" + url.PathEscape(id) + "/tracks?" + url.Values{
+		path := "/playlists/" + url.PathEscape(id) + "/items?" + url.Values{
 			"limit": {"100"}, "offset": {strconv.Itoa(offset)},
 		}.Encode()
 		if err := s.do(ctx, http.MethodGet, path, nil, &out); err != nil {
 			return items, err
 		}
 		for _, e := range out.Items {
-			if e.Track.URI != "" && strings.HasPrefix(e.Track.URI, "spotify:track:") {
-				items = append(items, e.Track.item())
+			t := e.Item
+			if t.URI == "" {
+				t = e.Track
+			}
+			if strings.HasPrefix(t.URI, "spotify:track:") {
+				items = append(items, t.item())
 			}
 		}
 		if out.Next == "" || len(out.Items) == 0 {

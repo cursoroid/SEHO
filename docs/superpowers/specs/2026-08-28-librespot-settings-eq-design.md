@@ -280,6 +280,20 @@ Tests stay local and untracked, following this repo's existing habit
 Manual verification: the spike above, then a real track from each source with
 the EQ visibly moving.
 
+## Verified against the live API and librespot, 2026-08-28
+
+What the implementation found, recorded here because the design guessed
+differently:
+
+| Assumption in this design | What is actually true |
+|---|---|
+| The pipe target needs proving | `--device <fifo>` works. The log line `Using StdoutSink (pipe)` is printed unconditionally; the file is opened lazily in the sink's `start()`, so it says nothing about the target |
+| librespot's second login might be avoidable via `--access-token` | Rejected by Spotify: `could not initialize spirc: Login request was denied: INVALID_CREDENTIALS`. A third-party client's token cannot open a librespot session. Two logins is what Spotify permits |
+| "Authenticated as" means librespot is usable | It does not. With a stale credential the session authenticates and is then refused at spirc, so the device never registers. Device visibility in the Web API is the only trustworthy readiness test |
+| `/playlists/{id}/tracks` lists a playlist | Returns 403. The endpoint is `/playlists/{id}/items`, and each entry keys on `item`, not `track`. Playlist objects also carry the count under `items.total`, not `tracks.total` |
+| Premium is the only playback prerequisite | It is not. Spotify withholds audio keys from newer accounts on every librespot login path (librespot#1649). Everything up to decryption works; every track then skips. No client-side fix exists |
+| `Load` can be called inline from the UI | It cannot. Waiting for a librespot session can take as long as a human in a browser, so the Spotify play path runs off the tview goroutine |
+
 ## Implementation order
 
 1. Spike: librespot pipe → fifo → mpv makes sound. Throwaway.

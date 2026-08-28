@@ -114,6 +114,20 @@ Spotify audio is piped from librespot into a second `mpv` instance rather than
 sent straight to the system output, which is what lets the equalizer apply to
 it. Browsing works without Premium; playback does not.
 
+### Known Spotify limitation, not a SEHO bug
+
+Since librespot 0.7, Spotify withholds audio decryption keys from **newer
+Spotify accounts**, whatever login method librespot uses
+([librespot#1649](https://github.com/librespot-org/librespot/issues/1649),
+open, many reports). On an affected account everything up to the audio works -
+librespot signs in, registers as a Connect device, Spotify accepts the play
+command - and then every track skips with `error audio key 0 1`. Older accounts
+are unaffected, and no client-side workaround exists; contributors have tried
+OAuth, their own client ids and the Android key.
+
+SEHO detects this and says so in the status line rather than leaving the
+transport creeping along in silence. Local playback is entirely unaffected.
+
 ## Sound profiles
 
 Profiles are parametric: a preamp plus peaking, shelf and pass filters,

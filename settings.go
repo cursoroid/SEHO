@@ -362,18 +362,24 @@ func (u *UI) selectProfile(p profile) {
 	u.applyEQ()
 }
 
+// eqChain is the filter chain the current profile renders to, or empty when the
+// equalizer is switched off.
+func (u *UI) eqChain() string {
+	if !u.set.Eff.EQ.Enabled {
+		return ""
+	}
+	return afChain(u.eq)
+}
+
 // applyEQ pushes the current chain to every backend that exists, so switching
 // source does not switch sound.
 func (u *UI) applyEQ() {
-	chain := ""
-	if u.set.Eff.EQ.Enabled {
-		chain = afChain(u.eq)
-	}
+	chain := u.eqChain()
 	if u.local != nil {
 		u.local.SetAF(chain)
 	}
-	if u.spot != nil {
-		u.spot.SetAF(chain)
+	if sp := u.spotify(); sp != nil {
+		sp.SetAF(chain)
 	}
 }
 
