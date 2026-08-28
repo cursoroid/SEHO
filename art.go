@@ -23,14 +23,20 @@ const maxCoverPixels = 4096 * 4096
 
 // AlbumArt renders a track's embedded cover as tview markup: h lines of w
 // cells, each cell two stacked pixels. Falls back to a flat block keyed off
-// the file path when there is no usable picture.
-func AlbumArt(path string, w, h int) string {
+// the album name (so every track on the same art-less album gets the same
+// tile) when there is no usable picture, or off the path when there is no
+// album either.
+func AlbumArt(path, album string, w, h int) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
 	img, err := coverImage(path)
 	if err != nil {
-		return fallbackBlock(path, w, h)
+		seed := album
+		if seed == "" {
+			seed = path
+		}
+		return fallbackBlock(seed, w, h)
 	}
 	return halfBlocks(img, w, h)
 }

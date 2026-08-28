@@ -20,8 +20,7 @@ directory into Redis and plays tracks through `mpv`.
 - `ffprobe` (ships with [FFmpeg](https://ffmpeg.org/)), optional - only used
   to read a track's duration at scan time; mpv backfills it during playback
   when `ffprobe` is unavailable or was skipped
-- A truecolor terminal to render album art (the Now Playing card falls back
-  to a plain tile otherwise)
+- A truecolor terminal, so the Now Playing card's album art renders correctly
 
 ## Configuration
 

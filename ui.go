@@ -36,14 +36,18 @@ func applyTheme() {
 		PrimitiveBackgroundColor:    mocha.Base,
 		ContrastBackgroundColor:     mocha.Surface2,
 		MoreContrastBackgroundColor: mocha.Surface1,
-		BorderColor:                 mocha.Surface1,
-		TitleColor:                  mocha.Lavender,
-		GraphicsColor:               mocha.Surface1,
-		PrimaryTextColor:            mocha.Text,
-		SecondaryTextColor:          mocha.Subtext0,
-		TertiaryTextColor:           mocha.Overlay0,
-		InverseTextColor:            mocha.Base,
-		ContrastSecondaryTextColor:  mocha.Mauve,
+		// Accepted gap: the palette design calls for a mauve *focused* border,
+		// but tview v0.42's Theme has a single BorderColor with no separate
+		// focus variant, so it stays surface1 in both states. Focus is
+		// signalled by tview's built-in double-line border rune set instead.
+		BorderColor:                mocha.Surface1,
+		TitleColor:                 mocha.Lavender,
+		GraphicsColor:              mocha.Surface1,
+		PrimaryTextColor:           mocha.Text,
+		SecondaryTextColor:         mocha.Subtext0,
+		TertiaryTextColor:          mocha.Overlay0,
+		InverseTextColor:           mocha.Base,
+		ContrastSecondaryTextColor: mocha.Mauve,
 	}
 }
 
@@ -66,8 +70,13 @@ type UI struct {
 	root      *tview.Flex
 
 	all     []item // everything in the library
+	base    []item // the view search filters within: all, or a sidebar/group narrowing
 	shown   []item // current table contents, and the play queue
 	playing int    // index into shown, -1 when nothing is playing
+
+	// baseTitle is the table title for the current base view (e.g. " TRACKS "
+	// or " TRACKS · Artists "), restored verbatim when a search is cleared.
+	baseTitle string
 
 	// layoutWidth is the terminal width relayout last built the body Flex
 	// for, so repeated draws at the same width are a no-op.
@@ -85,10 +94,6 @@ type UI struct {
 	paused                       bool
 	vol                          int
 	nowTitle, nowArtist, nowPath string
-
-	// userStopped marks a deliberate stop (currently: quitting) so the
-	// end-file it produces does not trigger auto-advance.
-	userStopped bool
 }
 
 func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
@@ -248,7 +253,7 @@ func cell(s string, c tcell.Color) *tview.TableCell {
 	return tview.NewTableCell(s).SetTextColor(c)
 }
 
-// trackSource lets fuzzy match against title, artist and album at once.
+// trackSource lets fuzzy match against a track's title and artist at once.
 type trackSource []item
 
 func (t trackSource) Len() int            { return len(t) }
@@ -289,22 +294,25 @@ func highlight(s string, idx []int) string {
 	return b.String()
 }
 
-// applyFilter repaints the table with fuzzy matches, ranked by score.
+// applyFilter repaints the table with fuzzy matches against the current base
+// view (u.base), ranked by score - so search composes with whatever
+// sidebar/group narrowing is already applied instead of clobbering it. An
+// empty query restores that base view verbatim.
 func (u *UI) applyFilter(query string) {
 	if query == "" {
-		u.table.SetTitle(" TRACKS ")
-		u.setTracks(u.all)
+		u.table.SetTitle(u.baseTitle)
+		u.setTracks(u.base)
 		return
 	}
 
-	matches := fuzzy.FindFrom(query, trackSource(u.all))
+	matches := fuzzy.FindFrom(query, trackSource(u.base))
 	u.shown = make([]item, 0, len(matches))
 	u.table.Clear()
 
 	u.paintTableHeader()
 
 	for row, m := range matches {
-		it := u.all[m.Index]
+		it := u.base[m.Index]
 		u.shown = append(u.shown, it)
 
 		// MatchedIndexes are BYTE positions in title+" "+artist; split at the title boundary.
@@ -324,7 +332,7 @@ func (u *UI) applyFilter(query string) {
 		u.table.SetCell(row+1, 3, cell(fmtDuration(it.duration), mocha.Subtext0))
 	}
 
-	u.table.SetTitle(fmt.Sprintf(" TRACKS · search: %s ", query))
+	u.table.SetTitle(fmt.Sprintf(" TRACKS · search: %s ", tview.Escape(query)))
 	if len(u.shown) > 0 {
 		u.table.Select(1, 0)
 	}
@@ -359,13 +367,15 @@ func (u *UI) resyncPlaying(path string) {
 func (u *UI) filterBySection(section string) {
 	switch section {
 	case "All Tracks":
-		u.setTracks(u.all)
+		u.base = u.all
 	case "Recent":
-		u.setTracks(recentTracks(u.all, 50))
+		u.base = recentTracks(u.all, 50)
 	case "Artists", "Albums", "Tags":
-		u.setTracks(groupBy(u.all, section))
+		u.base = groupBy(u.all, section)
 	}
-	u.table.SetTitle(fmt.Sprintf(" TRACKS · %s ", section))
+	u.baseTitle = fmt.Sprintf(" TRACKS · %s ", section) // section is one of the fixed sidebarSections, not user data
+	u.setTracks(u.base)
+	u.table.SetTitle(u.baseTitle)
 }
 
 // recentTracks returns the newest n items by added_at, newest first.
@@ -433,28 +443,34 @@ func (u *UI) filterByGroup(field, key string) {
 			out = append(out, it)
 		}
 	}
-	u.setTracks(out)
-	u.table.SetTitle(fmt.Sprintf(" TRACKS · %s ", key))
+	u.base = out
+	u.baseTitle = fmt.Sprintf(" TRACKS · %s ", tview.Escape(key))
+	u.setTracks(u.base)
+	u.table.SetTitle(u.baseTitle)
+}
+
+// padWidth returns the padding needed to right-align a block of the given
+// parts within a w-cell line, floored at 1 (GetInnerRect can report 0 on the
+// very first draw, before layout runs, which would otherwise go negative).
+// Widths are counted with tview.TaggedStringWidth rather than a rune count,
+// so tags don't count against the width and wide runes (e.g. CJK) count as
+// the two display cells they occupy - a plain rune count under-counts those
+// by about one cell each, drifting and clipping the right-aligned block.
+func padWidth(w int, parts ...string) int {
+	used := 0
+	for _, p := range parts {
+		used += tview.TaggedStringWidth(p)
+	}
+	return max(1, w-used)
 }
 
 // refreshHeader right-aligns the track count to the pane's actual width.
-// GetInnerRect can report 0 on the very first draw (before layout runs), so
-// the pad is floored at 1 rather than going negative.
 func (u *UI) refreshHeader() {
 	label := fmt.Sprintf("%d tracks", len(u.all))
 	_, _, w, _ := u.header.GetInnerRect()
-	pad := max(1, w-len("  SEHO")-len(label))
+	pad := padWidth(w, "  SEHO", label)
 	u.header.SetText(fmt.Sprintf("  [%s::b]SEHO[-::-]%*s[%s]%d tracks",
 		mocha.Lavender.String(), pad, "", mocha.Subtext0.String(), len(u.all)))
-}
-
-// selectedTrack returns the highlighted track. Row 0 is the header.
-func (u *UI) selectedTrack() (item, bool) {
-	row, _ := u.table.GetSelection()
-	if row < 1 || row > len(u.shown) {
-		return item{}, false
-	}
-	return u.shown[row-1], true
 }
 
 func (u *UI) playRow(row int) {
@@ -464,9 +480,8 @@ func (u *UI) playRow(row int) {
 	u.playing = row
 	u.nowTitle, u.nowArtist, u.nowPath = u.shown[row].title, u.shown[row].desc, u.shown[row].path
 	u.pos, u.dur = 0, u.shown[row].duration
-	u.userStopped = false
 	if err := u.pl.Load(u.shown[row].path); err != nil {
-		u.setStatus(fmt.Sprintf("[%s]playback failed: %v", mocha.Red.String(), err))
+		u.setStatus(fmt.Sprintf("[%s]playback failed: %v", mocha.Red.String(), tview.Escape(err.Error())))
 		return
 	}
 	u.table.Select(row+1, 0)
@@ -492,12 +507,15 @@ func nextPlayIndex(current, length int) (next int, ok bool) {
 //
 // When u.playing is already -1 (nothing playing, or the playing track is not
 // visible in the current view - e.g. the user switched to a grouped view
-// mid-playback) this is a deliberate no-op: there is no way to know which row
-// "next" means, so auto-advance simply pauses until the playing track is
-// visible again. It does not snapshot a separate queue to work around this -
-// the visible list is the queue, by design.
+// mid-playback) there is no way to know which row "next" means, so this does
+// not walk the queue - it just clears the now-playing state so the transport
+// reads "nothing playing" instead of showing a stale track forever. It does
+// not snapshot a separate queue to work around this - the visible list is the
+// queue, by design.
 func (u *UI) advance() {
 	if u.playing < 0 {
+		u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
+		u.drawCard(item{})
 		return
 	}
 	next, ok := nextPlayIndex(u.playing, len(u.shown))
@@ -518,11 +536,11 @@ const (
 // drawCard paints the NOW PLAYING card: embedded album art (or a fallback
 // tile) plus the track's title and artist beneath it.
 func (u *UI) drawCard(it item) {
-	if it.path == "" {
+	if it.path == "" || u.layoutWidth < 110 {
 		u.card.SetText("")
 		return
 	}
-	art := AlbumArt(it.path, artCells, artRows)
+	art := AlbumArt(it.path, it.album, artCells, artRows)
 	u.card.SetText(fmt.Sprintf("\n%s\n  [%s::b]%s[-::-]\n  [%s]%s",
 		art, mocha.Text.String(), tview.Escape(it.title), mocha.Subtext0.String(), tview.Escape(it.desc)))
 }
@@ -585,19 +603,14 @@ func (u *UI) drawTransport() {
 	// idle playback reads "■  nothing playing ·" with a dangling middot.
 	left := fmt.Sprintf("  [%s]%s[-]  [%s::b]%s[-::-]",
 		iconColor.String(), icon, mocha.Text.String(), tview.Escape(title))
-	leftPlain := "  " + icon + "  " + title
 	if u.nowArtist != "" {
 		left += fmt.Sprintf(" [%s]· %s[-]", mocha.Subtext0.String(), tview.Escape(u.nowArtist))
-		leftPlain += " · " + u.nowArtist
 	}
 
-	right := fmt.Sprintf("[%s]vol %s %d%%", mocha.Subtext0.String(), volMeter(u.vol), u.vol)
-	rightPlain := fmt.Sprintf("vol %s %d%%", volMeter(u.vol), u.vol)
+	right := fmt.Sprintf("[%s]vol %s %d%%", mocha.Peach.String(), volMeter(u.vol), u.vol)
 
-	// GetInnerRect can report 0 on the very first draw; the pad is floored at
-	// 1 so the line still renders instead of computing a negative repeat count.
 	_, _, w, _ := u.transport.GetInnerRect()
-	pad := max(1, w-len([]rune(leftPlain))-len([]rune(rightPlain)))
+	pad := padWidth(w, left, right)
 	line1 := left + strings.Repeat(" ", pad) + right
 
 	frac := 0.0
@@ -618,11 +631,14 @@ func (u *UI) setStatus(markup string) { u.transport.SetText("  " + markup) }
 func (u *UI) reload() {
 	items, err := listTracks(context.Background(), u.rdb)
 	if err != nil {
-		u.setStatus(fmt.Sprintf("[%s]library read failed: %v", mocha.Red.String(), err))
+		u.setStatus(fmt.Sprintf("[%s]library read failed: %v", mocha.Red.String(), tview.Escape(err.Error())))
 		return
 	}
 	u.all = items
+	u.base = items
+	u.baseTitle = " TRACKS "
 	u.setTracks(items)
+	u.table.SetTitle(u.baseTitle)
 }
 
 // pumpEvents forwards mpv state onto the UI goroutine. Runs for the app's life.
@@ -661,15 +677,11 @@ func (u *UI) pumpEvents() {
 				// "error" (unplayable) should walk the queue forward.
 				switch ev.Reason {
 				case "error":
-					u.setStatus(fmt.Sprintf("[%s]could not play %s", mocha.Red.String(), u.nowTitle))
-					if !u.userStopped {
-						u.advance()
-					}
+					u.setStatus(fmt.Sprintf("[%s]could not play %s", mocha.Red.String(), tview.Escape(u.nowTitle)))
+					u.advance()
 					return
 				case "eof":
-					if !u.userStopped {
-						u.advance()
-					}
+					u.advance()
 				}
 			case "disconnected":
 				u.setStatus(fmt.Sprintf("[%s]lost connection to mpv", mocha.Red.String()))
@@ -772,7 +784,6 @@ func (u *UI) bindKeys() {
 			u.openSearch()
 			return nil
 		case 'q':
-			u.userStopped = true
 			u.app.Stop()
 			return nil
 		case 's':
@@ -782,10 +793,12 @@ func (u *UI) bindKeys() {
 			u.pl.TogglePause()
 			return nil
 		case 'n':
-			if u.playing < 0 {
-				return nil
-			}
-			u.playRow(u.playing + 1)
+			switch {
+			case u.nowPath == "": // nothing has ever played: start at the top
+				u.playRow(0)
+			case u.playing >= 0: // playing, and visible in this view
+				u.playRow(u.playing + 1)
+			} // else: playing but filtered out of view - no-op, ambiguous "next"
 			return nil
 		case 'p':
 			if u.playing < 0 {
