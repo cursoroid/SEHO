@@ -194,6 +194,19 @@ func (u *UI) relayout(width int) {
 		u.body.AddItem(u.table, 0, 1, true)
 	}
 
+	// drawCard is only ever called from playRow/advance, never from here, so
+	// widening back past the card breakpoint would otherwise leave it blank
+	// until the next track change (it was skipped while narrow - see
+	// drawCard's u.layoutWidth guard). Repaint from u.nowPath rather than
+	// u.playing: u.playing is -1 whenever the playing track is filtered out
+	// of the current u.shown, but u.nowPath + u.all always resolve it. Setting
+	// the TextView's text here is fine even though relayout runs inside
+	// SetBeforeDrawFunc with the app lock held; see the focus fix-up below for
+	// what is NOT safe to call from here.
+	if width >= 110 && u.nowPath != "" {
+		u.drawCard(itemByPath(u.all, u.nowPath))
+	}
+
 	// Focus may have been on a pane that is now hidden. This cannot call
 	// u.app.GetFocus()/SetFocus() directly: relayout runs from
 	// SetBeforeDrawFunc, invoked while Application.draw() already holds the
@@ -474,7 +487,11 @@ func (u *UI) refreshHeader() {
 }
 
 func (u *UI) playRow(row int) {
-	if row < 0 || row >= len(u.shown) {
+	// Belt-and-braces: playRow is the single choke point every play path runs
+	// through, so it refuses a group pseudo-row here too, on top of the
+	// callers that already know to avoid one (filterByGroup never calls this;
+	// bindKeys' SelectedFunc routes a group row to filterByGroup instead).
+	if row < 0 || row >= len(u.shown) || u.shown[row].group {
 		return
 	}
 	u.playing = row
@@ -486,6 +503,20 @@ func (u *UI) playRow(row int) {
 	}
 	u.table.Select(row+1, 0)
 	u.drawCard(u.shown[row])
+}
+
+// firstPlayableRow returns the index of the first non-group row in shown, or
+// -1 when there isn't one (e.g. a grouped sidebar view before any group is
+// picked). Used by the "nothing has ever played" n path so it never starts
+// playback on a group pseudo-row - see filterByGroup/resyncPlaying for why a
+// group row must never be mistaken for a playable track.
+func firstPlayableRow(shown []item) int {
+	for i, it := range shown {
+		if !it.group {
+			return i
+		}
+	}
+	return -1
 }
 
 // nextPlayIndex is the pure index arithmetic behind advance(): what to play
@@ -532,6 +563,19 @@ const (
 	artCells = 28 // cells wide
 	artRows  = 14 // cell rows => 28 pixels tall
 )
+
+// itemByPath finds the item in items matching path, or the zero item if none
+// does. Used to recover the currently-playing item by u.nowPath (rather than
+// indexing u.shown by u.playing, which is -1 whenever the playing track is
+// filtered out of the current view) so the card can still be repainted.
+func itemByPath(items []item, path string) item {
+	for _, it := range items {
+		if it.path == path {
+			return it
+		}
+	}
+	return item{}
+}
 
 // drawCard paints the NOW PLAYING card: embedded album art (or a fallback
 // tile) plus the track's title and artist beneath it.
@@ -795,7 +839,7 @@ func (u *UI) bindKeys() {
 		case 'n':
 			switch {
 			case u.nowPath == "": // nothing has ever played: start at the top
-				u.playRow(0)
+				u.playRow(firstPlayableRow(u.shown))
 			case u.playing >= 0: // playing, and visible in this view
 				u.playRow(u.playing + 1)
 			} // else: playing but filtered out of view - no-op, ambiguous "next"
@@ -843,12 +887,12 @@ func (u *UI) cycleFocus(dir int) {
 // scan runs off the UI goroutine; every widget touch goes through QueueUpdateDraw.
 func (u *UI) scan() {
 	u.app.QueueUpdateDraw(func() {
-		u.setStatus(fmt.Sprintf("[%s]scanning %s...", mocha.Subtext0.String(), u.dir))
+		u.setStatus(fmt.Sprintf("[%s]scanning %s...", mocha.Subtext0.String(), tview.Escape(u.dir)))
 	})
 	n, err := scanDirectory(context.Background(), u.dir, u.rdb)
 	u.app.QueueUpdateDraw(func() {
 		if err != nil {
-			u.setStatus(fmt.Sprintf("[%s]scan failed: %v", mocha.Red.String(), err))
+			u.setStatus(fmt.Sprintf("[%s]scan failed: %v", mocha.Red.String(), tview.Escape(err.Error())))
 			return
 		}
 		u.setStatus(fmt.Sprintf("[%s]indexed %d new track(s)", mocha.Green.String(), n))
