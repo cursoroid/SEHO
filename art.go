@@ -14,10 +14,20 @@ import (
 	"github.com/dhowden/tag"
 )
 
+// Real covers, hi-res scans included, essentially never exceed 3000 square, and
+// we downsample to 28x28 regardless — so this rejects bombs without ever
+// refusing a genuine cover.
+// ponytail: a dimension gate, not a streaming decoder. The caller already falls
+// back to a generated tile, so "too big" and "no art" take the same path.
+const maxCoverPixels = 4096 * 4096
+
 // AlbumArt renders a track's embedded cover as tview markup: h lines of w
 // cells, each cell two stacked pixels. Falls back to a flat block keyed off
 // the file path when there is no usable picture.
 func AlbumArt(path string, w, h int) string {
+	if w <= 0 || h <= 0 {
+		return ""
+	}
 	img, err := coverImage(path)
 	if err != nil {
 		return fallbackBlock(path, w, h)
@@ -40,7 +50,24 @@ func coverImage(path string) (image.Image, error) {
 	if pic == nil || len(pic.Data) == 0 {
 		return nil, fmt.Errorf("no embedded picture in %s", path)
 	}
-	img, _, err := image.Decode(bytes.NewReader(pic.Data))
+	return decodeCoverBytes(pic.Data)
+}
+
+// decodeCoverBytes decodes raw embedded-picture bytes, rejecting anything
+// whose declared dimensions exceed maxCoverPixels before allocating a pixel
+// buffer for it. Split out from coverImage so the dimension gate can be unit
+// tested with a hand-built payload instead of a real tagged audio fixture.
+func decodeCoverBytes(data []byte) (image.Image, error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("cover art header: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 ||
+		int64(cfg.Width)*int64(cfg.Height) > maxCoverPixels {
+		return nil, fmt.Errorf("cover art %dx%d exceeds the decode limit", cfg.Width, cfg.Height)
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(data))
 	return img, err
 }
 
@@ -80,10 +107,16 @@ func boxAverage(img image.Image, gx, gy, gw, gh int) color.RGBA {
 	var r, g, bl, n uint64
 	for y := y0; y < y1 && y < bd.Max.Y; y++ {
 		for x := x0; x < x1 && x < bd.Max.X; x++ {
-			cr, cg, cb, _ := img.At(x, y).RGBA()
-			r += uint64(cr >> 8)
-			g += uint64(cg >> 8)
-			bl += uint64(cb >> 8)
+			cr, cg, cb, ca := img.At(x, y).RGBA()
+			if ca == 0 {
+				continue // fully transparent pixel contributes nothing
+			}
+			// img.At(...).RGBA() returns alpha-premultiplied components; undo
+			// that so a partially transparent PNG cover does not blend to
+			// black, then drop back to 8 bits.
+			r += uint64(cr) * 0xffff / uint64(ca) >> 8
+			g += uint64(cg) * 0xffff / uint64(ca) >> 8
+			bl += uint64(cb) * 0xffff / uint64(ca) >> 8
 			n++
 		}
 	}
