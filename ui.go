@@ -69,6 +69,18 @@ type UI struct {
 	shown   []item // current table contents, and the play queue
 	playing int    // index into shown, -1 when nothing is playing
 
+	// layoutWidth is the terminal width relayout last built the body Flex
+	// for, so repeated draws at the same width are a no-op.
+	layoutWidth int
+
+	// focusedSidebar tracks whether the sidebar currently holds focus.
+	// relayout cannot call u.app.GetFocus()/SetFocus() to find out: it runs
+	// from SetBeforeDrawFunc, which tview invokes while Application.draw()
+	// already holds the app's lock, and GetFocus/SetFocus take that same
+	// lock - calling either there deadlocks the very first draw. This bool
+	// is kept in sync by every place that actually moves focus instead.
+	focusedSidebar bool
+
 	pos, dur                     float64 // transport clock, seconds
 	paused                       bool
 	vol                          int
@@ -99,6 +111,7 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 		s := s
 		u.sidebar.AddItem(s, "", 0, func() {
 			u.filterBySection(s)
+			u.focusedSidebar = false
 			u.app.SetFocus(u.table)
 		})
 	}
@@ -136,12 +149,68 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 		AddItem(u.transport, 4, 0, false).
 		AddItem(u.footer, 1, 0, false)
 
+	u.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		w, _ := screen.Size()
+		u.relayout(w)
+		return false // false = let tview draw normally
+	})
+
 	u.app.SetRoot(u.root, true).SetFocus(u.table)
 	return u
 }
 
+// relayout hides columns that no longer fit. tview has no breakpoints, so this
+// rebuilds the body Flex on width change.
+// ponytail: rebuild rather than resize - three states, cheap, and it avoids
+// tracking per-item proportions.
+func (u *UI) relayout(width int) {
+	// refreshHeader recomputes every draw, not just on a width change:
+	// GetInnerRect reflects the *previous* draw's computed layout, so on the
+	// very first draw (before anything has been laid out) it is still 0.
+	// Gating this behind the width check would freeze the header's padding
+	// at that first, wrong guess until the next resize.
+	u.refreshHeader()
+
+	if width == u.layoutWidth {
+		return
+	}
+	u.layoutWidth = width
+
+	u.body.Clear()
+	switch {
+	case width >= 110:
+		u.body.AddItem(u.sidebar, 16, 0, false).
+			AddItem(u.table, 0, 1, true).
+			AddItem(u.card, 32, 0, false)
+	case width >= 80:
+		u.body.AddItem(u.sidebar, 16, 0, false).
+			AddItem(u.table, 0, 1, true)
+	default:
+		u.body.AddItem(u.table, 0, 1, true)
+	}
+
+	// Focus may have been on a pane that is now hidden. This cannot call
+	// u.app.GetFocus()/SetFocus() directly: relayout runs from
+	// SetBeforeDrawFunc, invoked while Application.draw() already holds the
+	// app's lock, and both of those methods take that same lock - calling
+	// either here deadlocks the very first draw. focusedSidebar is our own
+	// tracked copy, and the fix-up is dispatched to run after draw() returns.
+	if u.focusedSidebar && width < 80 {
+		u.focusedSidebar = false
+		go u.app.QueueUpdateDraw(func() { u.app.SetFocus(u.table) })
+	}
+
+	u.setFooter()
+}
+
+// textPane builds the fixed-height status panes (header, card, transport,
+// footer). SetWrap(false) matters once relayout is width-aware: GetInnerRect
+// lags one draw behind an actual resize, so a right-alignment pad computed
+// against the previous width can transiently overshoot the new, smaller one.
+// Wrapping would spill that overshoot into a second line and blow out these
+// panes' fixed heights; clipping it for one frame is the safe failure mode.
 func textPane(s string) *tview.TextView {
-	tv := tview.NewTextView().SetDynamicColors(true).SetText(s)
+	tv := tview.NewTextView().SetDynamicColors(true).SetText(s).SetWrap(false)
 	tv.SetBackgroundColor(mocha.Base)
 	return tv
 }
@@ -368,9 +437,15 @@ func (u *UI) filterByGroup(field, key string) {
 	u.table.SetTitle(fmt.Sprintf(" TRACKS · %s ", key))
 }
 
+// refreshHeader right-aligns the track count to the pane's actual width.
+// GetInnerRect can report 0 on the very first draw (before layout runs), so
+// the pad is floored at 1 rather than going negative.
 func (u *UI) refreshHeader() {
+	label := fmt.Sprintf("%d tracks", len(u.all))
+	_, _, w, _ := u.header.GetInnerRect()
+	pad := max(1, w-len("  SEHO")-len(label))
 	u.header.SetText(fmt.Sprintf("  [%s::b]SEHO[-::-]%*s[%s]%d tracks",
-		mocha.Lavender.String(), 50, "", mocha.Subtext0.String(), len(u.all)))
+		mocha.Lavender.String(), pad, "", mocha.Subtext0.String(), len(u.all)))
 }
 
 // selectedTrack returns the highlighted track. Row 0 is the header.
@@ -475,9 +550,12 @@ func progressBar(frac float64, width int) string {
 		mocha.Surface1.String(), strings.Repeat("─", width-fill))
 }
 
+// volMeter scales glyphs against 100 (not mpv's 130% overdrive ceiling) so the
+// default volume lights every glyph; values above 100 just show a full meter.
+// The numeric percentage shown alongside stays exact.
 func volMeter(v int) string {
 	bars := []rune("▁▃▅▇")
-	n := v * len(bars) / 130
+	n := min(len(bars), max(0, v*len(bars)/100))
 	out := make([]rune, 0, len(bars))
 	for i := range bars {
 		if i < n {
@@ -502,17 +580,30 @@ func (u *UI) drawTransport() {
 	if title == "" {
 		title = "nothing playing"
 	}
-	line1 := fmt.Sprintf("  [%s]%s[-]  [%s::b]%s[-::-] [%s]· %s%*s[%s]vol %s %d%%",
-		iconColor.String(), icon,
-		mocha.Text.String(), tview.Escape(title),
-		mocha.Subtext0.String(), tview.Escape(u.nowArtist), 4, "",
-		mocha.Subtext0.String(), volMeter(u.vol), u.vol)
+
+	// Only emit the "· artist" separator when there is an artist - otherwise
+	// idle playback reads "■  nothing playing ·" with a dangling middot.
+	left := fmt.Sprintf("  [%s]%s[-]  [%s::b]%s[-::-]",
+		iconColor.String(), icon, mocha.Text.String(), tview.Escape(title))
+	leftPlain := "  " + icon + "  " + title
+	if u.nowArtist != "" {
+		left += fmt.Sprintf(" [%s]· %s[-]", mocha.Subtext0.String(), tview.Escape(u.nowArtist))
+		leftPlain += " · " + u.nowArtist
+	}
+
+	right := fmt.Sprintf("[%s]vol %s %d%%", mocha.Subtext0.String(), volMeter(u.vol), u.vol)
+	rightPlain := fmt.Sprintf("vol %s %d%%", volMeter(u.vol), u.vol)
+
+	// GetInnerRect can report 0 on the very first draw; the pad is floored at
+	// 1 so the line still renders instead of computing a negative repeat count.
+	_, _, w, _ := u.transport.GetInnerRect()
+	pad := max(1, w-len([]rune(leftPlain))-len([]rune(rightPlain)))
+	line1 := left + strings.Repeat(" ", pad) + right
 
 	frac := 0.0
 	if u.dur > 0 {
 		frac = u.pos / u.dur
 	}
-	_, _, w, _ := u.transport.GetInnerRect()
 	barWidth := max(10, w-24)
 	line2 := fmt.Sprintf("  [%s]%s [-]%s[%s] %s",
 		mocha.Subtext0.String(), fmtDuration(u.pos),
@@ -599,11 +690,21 @@ func (u *UI) Run() error {
 	return u.app.Run()
 }
 
+// setFooter rebuilds the key-hint bar. "tab pane" only makes sense once the
+// sidebar is actually in the layout, so it tracks u.layoutWidth.
 func (u *UI) setFooter() {
 	m := mocha.Mauve.String()
-	u.footer.SetText(fmt.Sprintf(
-		"  [%s]/[-] search  [%s]space[-] pause  [%s]←→[-] seek  [%s]n/p[-] track  [%s]-/=[-] vol  [%s]s[-] scan  [%s]q[-] quit",
-		m, m, m, m, m, m, m))
+	keys := []string{"/[-] search", "space[-] pause", "←→[-] seek", "n/p[-] track", "-/=[-] vol"}
+	if u.layoutWidth >= 80 {
+		keys = append(keys, "tab[-] pane")
+	}
+	keys = append(keys, "s[-] scan", "q[-] quit")
+
+	var b strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&b, "  [%s]%s", m, k)
+	}
+	u.footer.SetText(b.String())
 }
 
 // openSearch replaces the footer row with the search field while active.
@@ -611,6 +712,7 @@ func (u *UI) openSearch() {
 	u.root.RemoveItem(u.footer)
 	u.root.AddItem(u.search, 1, 0, true)
 	u.search.SetText("")
+	u.focusedSidebar = false
 	u.app.SetFocus(u.search)
 }
 
@@ -621,6 +723,7 @@ func (u *UI) closeSearch(clear bool) {
 	if clear {
 		u.applyFilter("")
 	}
+	u.focusedSidebar = false
 	u.app.SetFocus(u.table)
 }
 
@@ -703,15 +806,24 @@ func (u *UI) bindKeys() {
 	})
 }
 
+// cycleFocus only cycles into the sidebar when it is actually in the layout -
+// otherwise tab would focus a hidden widget and the visible table would stop
+// responding to its own navigation keys.
 func (u *UI) cycleFocus(dir int) {
-	order := []tview.Primitive{u.table, u.sidebar}
+	order := []tview.Primitive{u.table}
+	if u.layoutWidth >= 80 {
+		order = []tview.Primitive{u.table, u.sidebar}
+	}
 	cur := u.app.GetFocus()
 	for i, p := range order {
 		if p == cur {
-			u.app.SetFocus(order[(i+len(order)+dir)%len(order)])
+			next := order[(i+len(order)+dir)%len(order)]
+			u.focusedSidebar = next == u.sidebar
+			u.app.SetFocus(next)
 			return
 		}
 	}
+	u.focusedSidebar = false
 	u.app.SetFocus(u.table)
 }
 
