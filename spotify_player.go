@@ -138,7 +138,7 @@ func StartSpotifyBackend(api *Spotify, cfg Config, announce func(string)) (*Spot
 		return nil, fmt.Errorf("open audio fifo: %w", err)
 	}
 
-	mpv, err := StartPlayer(rawAudioArgs()...)
+	mpv, err := StartPlayer(rawAudioArgs("s16le", 44100)...)
 	if err != nil {
 		hold.Close()
 		os.Remove(fifo)

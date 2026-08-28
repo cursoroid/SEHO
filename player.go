@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,9 +67,24 @@ type Player struct {
 }
 
 // StartPlayer spawns mpv in idle mode and attaches to its IPC socket. extra
-// carries per-instance flags: the Spotify instance adds raw-audio demuxer
-// options (see rawAudioArgs) because it reads a PCM fifo rather than files.
-func StartPlayer(extra ...string) (*Player, error) {
+// carries per-instance flags: a streaming instance adds raw-audio demuxer
+// options (see rawAudioArgs) because it reads PCM rather than files.
+func StartPlayer(extra ...string) (*Player, error) { return startPlayer(nil, extra...) }
+
+// StartPlayerFD is StartPlayer with file descriptors passed to mpv, which can
+// then read one of them as a stream: fds[0] becomes fd 3 in mpv, loadable as
+// "fd://3".
+//
+// This exists because SEHO itself is the writer for the Soloist backend, and a
+// FIFO cannot serve that case: POSIX leaves opening a FIFO O_RDWR undefined, and
+// on macOS a single read-write handle behaves as a private channel - writes
+// through it never reach a separate reader, so mpv sat at core-idle with the
+// file loaded and no audio. A pipe has one end each way and no such ambiguity.
+func StartPlayerFD(fds []*os.File, extra ...string) (*Player, error) {
+	return startPlayer(fds, extra...)
+}
+
+func startPlayer(fds []*os.File, extra ...string) (*Player, error) {
 	if _, err := exec.LookPath("mpv"); err != nil {
 		return nil, errors.New("mpv not found on PATH - install it with: brew install mpv")
 	}
@@ -83,6 +100,7 @@ func StartPlayer(extra ...string) (*Player, error) {
 		"--input-ipc-server=" + sock,
 	}, extra...)
 	cmd := exec.Command("mpv", args...)
+	cmd.ExtraFiles = fds
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start mpv: %w", err)
 	}
@@ -214,6 +232,39 @@ func (p *Player) send(args ...any) error {
 	}
 }
 
+// get reads one mpv property. Unlike send it returns the payload, which is what
+// makes it possible to ask mpv whether audio is genuinely decoding rather than
+// inferring it from the outside.
+func (p *Player) get(prop string) (json.RawMessage, error) {
+	p.mu.Lock()
+	p.nextID++
+	id := p.nextID
+	ch := make(chan mpvReply, 1)
+	p.pending[id] = ch
+	p.mu.Unlock()
+
+	payload, err := json.Marshal(map[string]any{"command": []any{"get_property", prop}, "request_id": id})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.conn.Write(append(payload, '\n')); err != nil {
+		return nil, err
+	}
+
+	select {
+	case r := <-ch:
+		if r.err != "" && r.err != "success" {
+			return nil, fmt.Errorf("mpv: %s", r.err)
+		}
+		return r.data, nil
+	case <-time.After(2 * time.Second):
+		p.mu.Lock()
+		delete(p.pending, id)
+		p.mu.Unlock()
+		return nil, fmt.Errorf("mpv did not answer get_property %s", prop)
+	}
+}
+
 // post writes a command without waiting for mpv's reply. Ordering is preserved
 // because all writes go through the same mutex-serialised connection.
 // ponytail: transport commands are fire-and-forget on purpose — mpv's
@@ -237,19 +288,24 @@ var sockSeq atomic.Int32
 
 func nextSockID() int32 { return sockSeq.Add(1) }
 
-// rawAudioArgs configures an mpv instance to read the raw stereo PCM that
-// librespot's pipe backend writes. The buffer settings matter: the default
+// rawAudioArgs configures an mpv instance to read raw stereo PCM from a pipe -
+// what librespot's pipe backend and Soloist's captured null sink both produce.
+// format is an mpv/ffmpeg sample format ("s16le", "s32le"); s32le is what keeps
+// the extra bits of a lossless stream. The buffer settings matter: the default
 // cache would put the transport bar a second or more behind what you hear.
-func rawAudioArgs() []string {
+func rawAudioArgs(format string, rate int) []string {
 	return []string{
 		"--demuxer=rawaudio",
-		"--demuxer-rawaudio-format=s16le",
-		"--demuxer-rawaudio-rate=44100",
+		"--demuxer-rawaudio-format=" + format,
+		"--demuxer-rawaudio-rate=" + strconv.Itoa(rate),
 		"--demuxer-rawaudio-channels=2",
 		"--cache=no",
 		"--audio-buffer=0.05",
 	}
 }
+
+// hostArch reports the machine architecture, used to pick a container platform.
+func hostArch() string { return runtime.GOARCH }
 
 func (p *Player) Load(path string) error   { return p.send("loadfile", path, "replace") }
 func (p *Player) TogglePause() error       { return p.post("cycle", "pause") }

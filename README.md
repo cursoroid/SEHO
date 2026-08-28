@@ -13,7 +13,9 @@ playback through `librespot` and an equalizer that covers both.
 - A themed track table, live transport bar and embedded album art, with a
   responsive layout that adapts to the terminal width.
 - Spotify search, Liked Songs and playlists in the same table as the local
-  library, played through `librespot`.
+  library, streamed through Spotify's own Soloist client (or librespot).
+- Lossless-preserving Spotify capture: 32-bit throughout, so the extra
+  resolution of Spotify's lossless tier is not thrown away.
 - A parametric equalizer with sound profiles, applied to local files and
   Spotify alike. Imports AutoEq and Equalizer APO files.
 - A settings page: music directory, Redis address, Spotify credentials,
@@ -24,9 +26,12 @@ playback through `librespot` and an equalizer that covers both.
 - [Go](https://golang.org/dl/) 1.23+
 - [Redis](https://redis.io/download) reachable at `REDIS_ADDR`
 - [`mpv`](https://mpv.io/) for playback, controlled over its JSON IPC socket
+- Docker, optional - only for Spotify, which streams through Spotify's Soloist
+  client (Linux-only, so it runs in a container; see [docker/](docker/)).
+  Spotify playback requires a Premium account.
 - [`librespot`](https://github.com/librespot-org/librespot) 0.8+, optional -
-  only needed for Spotify (`brew install librespot`). Spotify playback also
-  requires a Premium account.
+  an alternative Spotify client (`brew install librespot`), kept as a fallback.
+  Note it cannot stream on newer Spotify accounts; see below.
 - `ffprobe` (ships with [FFmpeg](https://ffmpeg.org/)), optional - only used
   to read a track's duration at scan time; mpv backfills it during playback
   when `ffprobe` is unavailable or was skipped
@@ -45,10 +50,14 @@ working; a field the environment controls shows read-only on the settings page.
 | `SPOTIFY_CLIENT_ID` | `spotify_client_id` | - | Spotify app client id |
 | `SEHO_DEVICE_NAME` | `device_name` | `SEHO` | Name librespot advertises |
 | `SEHO_BITRATE` | `bitrate` | `320` | Spotify bitrate: 96, 160 or 320 |
+| `SEHO_SPOTIFY_BACKEND` | `spotify_backend` | `soloist` | `soloist` or `librespot` |
+| - | `lossless` | `true` | capture Spotify at 32 bits rather than 16 |
+| - | `soloist_image` | `seho-soloist:latest` | container image to run |
+| `SOLOIST_API_KEY` | - | - | Soloist key; otherwise read from the keychain |
 
-The Spotify refresh token is not stored in that file: it goes to the macOS
-login keychain, falling back to `~/.config/seho/token.json` at mode `0600`
-where no keychain is available.
+The Spotify refresh token and the Soloist API key are not stored in that file:
+they go to the macOS login keychain, falling back to `0600` files in
+`~/.config/seho/` where no keychain is available.
 
 ## Run
 
@@ -102,31 +111,49 @@ The UI is responsive to terminal width:
 
 ## Spotify
 
-1. `brew install librespot`.
-2. Create an app at [developer.spotify.com](https://developer.spotify.com/dashboard)
-   and add `http://127.0.0.1:8898/callback` as a redirect URI. Only the client
-   id is needed - SEHO uses PKCE and never asks for a client secret.
-3. Press `,`, paste the client id, Save, then **Connect Spotify**. Two browser
-   trips happen on the first run: one for SEHO's own API access, one for
-   librespot's audio session. Both are cached afterwards.
+Two clients can stream Spotify. Soloist is the default.
 
-Spotify audio is piped from librespot into a second `mpv` instance rather than
+| | Soloist | librespot |
+|---|---|---|
+| Whose client | Spotify's own | third-party |
+| Streams on new accounts | yes | **no** - see below |
+| Runs on macOS | in Docker (Linux-only binary) | natively |
+| Control | local WebSocket, event-driven | Spotify Web API, polled |
+| Auth | Premium + API key + one pairing | two OAuth logins |
+
+### Setup
+
+1. Create an app at [developer.spotify.com](https://developer.spotify.com/dashboard)
+   and add `http://127.0.0.1:8898/callback` as a redirect URI. Only the client
+   id is needed - SEHO uses PKCE and never asks for a client secret. This is
+   what browsing (search, Liked Songs, playlists) uses.
+2. Press `,`, paste the client id, Save, then **Connect Spotify**.
+3. For playback, build and pair the Soloist container once:
+   see [docker/README.md](docker/README.md). Paste its API key on the settings
+   page.
+
+SEHO then starts the container on the first Spotify track you play, and stops it
+on exit. Nothing is spawned if you only ever play local files.
+
+Spotify audio is piped from the client into a second `mpv` instance rather than
 sent straight to the system output, which is what lets the equalizer apply to
 it. Browsing works without Premium; playback does not.
 
-### Known Spotify limitation, not a SEHO bug
+### librespot cannot stream on newer accounts
 
-Since librespot 0.7, Spotify withholds audio decryption keys from **newer
-Spotify accounts**, whatever login method librespot uses
-([librespot#1649](https://github.com/librespot-org/librespot/issues/1649),
-open, many reports). On an affected account everything up to the audio works -
-librespot signs in, registers as a Connect device, Spotify accepts the play
-command - and then every track skips with `error audio key 0 1`. Older accounts
-are unaffected, and no client-side workaround exists; contributors have tried
-OAuth, their own client ids and the Android key.
+Since librespot 0.7, Spotify withholds audio decryption keys from newer Spotify
+accounts, whatever login method librespot uses
+([librespot#1649](https://github.com/librespot-org/librespot/issues/1649), open,
+many reports). Everything up to the audio works - it signs in, registers as a
+Connect device, Spotify accepts the play command - and then every track skips
+with `error audio key 0 1`. Older accounts are unaffected and no client-side
+workaround exists; contributors have tried OAuth, their own client ids and the
+Android key. Also verified here: librespot 0.8's `--access-token` cannot reuse
+SEHO's own token, because Spotify rejects a third-party client's token for a
+librespot session (`Login request was denied: INVALID_CREDENTIALS`).
 
-SEHO detects this and says so in the status line rather than leaving the
-transport creeping along in silence. Local playback is entirely unaffected.
+SEHO detects the key refusal and says so in the status line rather than leaving
+the transport creeping along in silence. This is why Soloist is the default.
 
 ## Sound profiles
 
@@ -154,8 +181,8 @@ speaker profiles here are taste, not correction, and the sound page says so.
 
 - **API**: expose the library over HTTP so clients other than the TUI can use it.
 - **Spotify albums and artists**: only search, Liked Songs and playlists so far.
-- **Single Spotify login**: librespot 0.8 accepts `--access-token`, which could
-  remove the second browser trip once its scope requirements are confirmed.
+- **Pairing from the app**: Soloist pairing is a documented manual step; SEHO
+  could run it (and the mDNS proxy) from the settings page.
 - **Streaming**: serve audio over HTTP instead of shelling out to a local `mpv` instance.
 - **Frontend**: a web UI, once the API exists.
 - **Docker**: worth doing once there is a server to run; a TTY-only TUI is not.

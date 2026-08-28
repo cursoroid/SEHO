@@ -74,6 +74,30 @@ func (u *UI) showSettings() {
 
 	form.AddTextView("Spotify account", u.spotifyAccountLine(), 0, 2, true, false)
 
+	// Which client actually streams. Soloist is Spotify's own and works on
+	// accounts librespot cannot stream on at all, so it leads.
+	backends := []string{backendSoloist, backendLibrespot}
+	if env, locked := set.Env["spotify_backend"]; locked {
+		form.AddTextView("Playback client", fmt.Sprintf("%s  (set by %s)", set.Eff.SpotifyBackend, env), 0, 1, true, false)
+	} else {
+		idx := 0
+		if set.File.SpotifyBackend == backendLibrespot {
+			idx = 1
+		}
+		form.AddDropDown("Playback client", backends, idx, func(opt string, _ int) {
+			set.File.SpotifyBackend = opt
+		})
+	}
+
+	form.AddCheckbox("Lossless capture", set.File.Lossless, func(on bool) {
+		set.File.Lossless = on
+	})
+
+	form.AddInputField("Soloist API key", maskKey(LoadSoloistKey()), 0, nil, func(v string) {
+		u.soloistKeyEdit = v
+	})
+	form.AddTextView("Soloist", u.soloistStatusLine(), 0, 2, true, false)
+
 	if u.api != nil && u.api.Connected() {
 		form.AddButton("Disconnect Spotify", func() {
 			if err := u.api.Disconnect(); err != nil {
@@ -126,6 +150,42 @@ func (u *UI) spotifyAccountLine() string {
 	}
 }
 
+// maskKey shows enough of a stored credential to recognise it, and no more.
+func maskKey(k string) string {
+	if k == "" {
+		return ""
+	}
+	if len(k) <= 10 {
+		return "…"
+	}
+	return k[:6] + "…" + k[len(k)-4:]
+}
+
+// soloistStatusLine describes the Soloist side: the container image, whether it
+// is paired, and what to do about it if not.
+func (u *UI) soloistStatusLine() string {
+	if u.set.Eff.SpotifyBackend != backendSoloist {
+		return "not in use - playback client is " + u.set.Eff.SpotifyBackend
+	}
+	if err := dockerAvailable(); err != nil {
+		return err.Error()
+	}
+	if err := soloistImagePresent(u.set.Eff.SoloistImage); err != nil {
+		return "image missing - build it: docker build -t " + u.set.Eff.SoloistImage + " ./docker"
+	}
+	if LoadSoloistKey() == "" {
+		return "no API key - create one at developer.spotify.com and paste it above"
+	}
+	if !soloistPaired() {
+		return "not paired - see docker/README.md (one-time, needs an mDNS proxy on macOS)"
+	}
+	format := "16-bit"
+	if u.set.Eff.Lossless {
+		format = "32-bit (lossless-preserving)"
+	}
+	return "ready, capturing " + format
+}
+
 // dependencyLines reports the external programs SEHO shells out to, so a
 // missing one is visible here rather than only at the moment it fails.
 func (u *UI) dependencyLines() string {
@@ -176,6 +236,16 @@ func (u *UI) saveSettings() {
 	u.dir = u.set.Eff.MusicDir
 	if u.api != nil {
 		u.api.SetClientID(u.set.Eff.SpotifyClientID)
+	}
+
+	// An untouched key field shows the masked value, which must never be stored
+	// back over the real one.
+	if k := strings.TrimSpace(u.soloistKeyEdit); k != "" && !strings.Contains(k, "…") {
+		if err := SaveSoloistKey(k); err != nil {
+			u.setStatus(errMarkup("store Soloist key: " + err.Error()))
+			return
+		}
+		u.soloistKeyEdit = ""
 	}
 
 	var notes []string

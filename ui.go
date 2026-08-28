@@ -34,9 +34,9 @@ type UI struct {
 	active source
 
 	// spot is created lazily and read from both the UI goroutine and the
-	// goroutine that starts it, so every access goes through spotMu. It is one
-	// pointer, so one mutex is the whole story - see spotify().
-	spot   *SpotifyBackend
+	// goroutine that starts it, so every access goes through spotMu. Its
+	// concrete type depends on Config.SpotifyBackend - see ensureSpotify.
+	spot   Backend
 	spotMu sync.Mutex
 
 	// eq is the live profile. It may differ from the saved one while the sound
@@ -70,6 +70,10 @@ type UI struct {
 	// spotifyView is true when the current base view came from the Spotify API,
 	// which is what makes "/" search the catalogue instead of the local list.
 	spotifyView bool
+
+	// soloistKeyEdit holds a Soloist API key typed on the settings page until
+	// Save stores it in the keychain.
+	soloistKeyEdit string
 
 	// searchRemote is true while the search field is querying Spotify rather
 	// than fuzzy-filtering the local base view.
@@ -580,7 +584,7 @@ func (u *UI) refreshHeader() {
 }
 
 // spotify returns the Spotify backend, or nil when it has not been started.
-func (u *UI) spotify() *SpotifyBackend {
+func (u *UI) spotify() Backend {
 	u.spotMu.Lock()
 	defer u.spotMu.Unlock()
 	return u.spot
@@ -614,7 +618,11 @@ func (u *UI) stopOther(next source) {
 //
 // Never call this from the UI goroutine - it spawns processes and may refresh
 // an OAuth token over the network. startSpotifyTrack is the entry point.
-func (u *UI) ensureSpotify() (*SpotifyBackend, error) {
+//
+// Which backend depends on config: Soloist (Spotify's own client, in a
+// container) or librespot. Browsing goes through the Web API either way, so an
+// API connection is required for both.
+func (u *UI) ensureSpotify() (Backend, error) {
 	u.spotMu.Lock()
 	defer u.spotMu.Unlock()
 	if u.spot != nil {
@@ -624,14 +632,24 @@ func (u *UI) ensureSpotify() (*SpotifyBackend, error) {
 		return nil, fmt.Errorf("connect Spotify in settings first (press ,)")
 	}
 
-	sp, err := StartSpotifyBackend(u.api, u.set.Eff, func(url string) {
-		u.app.QueueUpdateDraw(func() {
-			u.setStatus(fmt.Sprintf("[%s]librespot sign-in: %s", mocha.Subtext0.String(), tview.Escape(url)))
+	var (
+		sp  Backend
+		err error
+	)
+	if u.set.Eff.SpotifyBackend == backendSoloist {
+		sp, err = StartSoloistBackend(u.set.Eff, LoadSoloistKey())
+	} else {
+		sp, err = StartSpotifyBackend(u.api, u.set.Eff, func(url string) {
+			u.app.QueueUpdateDraw(func() {
+				u.setStatus(fmt.Sprintf("[%s]librespot sign-in: %s",
+					mocha.Subtext0.String(), tview.Escape(url)))
+			})
 		})
-	})
+	}
 	if err != nil {
 		return nil, err
 	}
+
 	u.spot = sp
 	go u.pumpEvents(srcSpotify, sp.Events())
 	sp.SetVolume(u.vol)

@@ -21,6 +21,20 @@ type Config struct {
 	Bitrate         int      `json:"bitrate"`
 	Volume          int      `json:"volume"`
 	EQ              EQConfig `json:"eq"`
+
+	// SpotifyBackend is "soloist" or "librespot". Soloist is Spotify's own
+	// headless client and streams reliably; librespot is refused audio keys on
+	// newer accounts (librespot#1649). Soloist is Linux-only, so on macOS it
+	// runs in Docker - see docker/.
+	SpotifyBackend string `json:"spotify_backend"`
+
+	// SoloistImage is the container image built from docker/Dockerfile.
+	SoloistImage string `json:"soloist_image"`
+
+	// Lossless captures Soloist's output at 32 bits instead of 16. Spotify's
+	// lossless tier carries more than 16 bits, and a 16-bit capture would throw
+	// that away before SEHO ever saw it.
+	Lossless bool `json:"lossless"`
 }
 
 // EQConfig records which profile is selected and, when the user has edited its
@@ -46,12 +60,15 @@ type Settings struct {
 
 func defaultConfig() Config {
 	return Config{
-		MusicDir:   defaultMusicDir(),
-		RedisAddr:  "127.0.0.1:6379",
-		DeviceName: "SEHO",
-		Bitrate:    320,
-		Volume:     100,
-		EQ:         EQConfig{Enabled: true, Profile: defaultProfileName()},
+		MusicDir:       defaultMusicDir(),
+		RedisAddr:      "127.0.0.1:6379",
+		DeviceName:     "SEHO",
+		Bitrate:        320,
+		Volume:         100,
+		EQ:             EQConfig{Enabled: true, Profile: defaultProfileName()},
+		SpotifyBackend: backendSoloist,
+		SoloistImage:   "seho-soloist:latest",
+		Lossless:       true,
 	}
 }
 
@@ -117,6 +134,10 @@ func applyEnv(file Config, getenv func(string) string) Settings {
 		s.Eff.DeviceName = v
 		s.Env["device_name"] = "SEHO_DEVICE_NAME"
 	}
+	if v := getenv("SEHO_SPOTIFY_BACKEND"); v != "" {
+		s.Eff.SpotifyBackend = v
+		s.Env["spotify_backend"] = "SEHO_SPOTIFY_BACKEND"
+	}
 	if v := getenv("SEHO_BITRATE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			s.Eff.Bitrate = n
@@ -145,6 +166,15 @@ func (s *Settings) Save() error {
 const (
 	keychainService = "seho"
 	keychainAccount = "spotify-refresh"
+	// The Soloist developer API key is a credential too, so it lives beside the
+	// refresh token rather than in the plain config file.
+	keychainSoloist = "soloist-api-key"
+)
+
+// Backend names for Config.SpotifyBackend.
+const (
+	backendSoloist   = "soloist"
+	backendLibrespot = "librespot"
 )
 
 func tokenFilePath() string { return filepath.Join(configDir(), "token.json") }
@@ -180,6 +210,64 @@ func saveTokenFile(tok string) error {
 		return err
 	}
 	return os.WriteFile(tokenFilePath(), b, 0o600)
+}
+
+// SaveSoloistKey stores the Soloist developer API key.
+func SaveSoloistKey(key string) error { return saveSecret(keychainSoloist, key, soloistKeyPath()) }
+
+// LoadSoloistKey returns the stored Soloist key, preferring the keychain and
+// falling back to a 0600 file. SOLOIST_API_KEY overrides both, so a key can be
+// supplied for one run without storing it anywhere.
+func LoadSoloistKey() string {
+	if v := os.Getenv("SOLOIST_API_KEY"); v != "" {
+		return v
+	}
+	tok, _ := loadSecret(keychainSoloist, soloistKeyPath())
+	return tok
+}
+
+func soloistKeyPath() string { return filepath.Join(configDir(), "soloist-key.json") }
+
+// saveSecret and loadSecret are the generic halves of the token storage above,
+// shared by the refresh token and the Soloist key.
+func saveSecret(account, value, fallback string) error {
+	if runtime.GOOS == "darwin" {
+		cmd := exec.Command("security", "add-generic-password",
+			"-s", keychainService, "-a", account, "-w", value, "-U")
+		if err := cmd.Run(); err == nil {
+			os.Remove(fallback)
+			return nil
+		}
+	}
+	if err := os.MkdirAll(configDir(), 0o700); err != nil {
+		return err
+	}
+	b, err := json.Marshal(map[string]string{"value": value})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(fallback, b, 0o600)
+}
+
+func loadSecret(account, fallback string) (string, bool) {
+	if runtime.GOOS == "darwin" {
+		out, err := exec.Command("security", "find-generic-password",
+			"-s", keychainService, "-a", account, "-w").Output()
+		if err == nil {
+			if t := strings.TrimSpace(string(out)); t != "" {
+				return t, true
+			}
+		}
+	}
+	b, err := os.ReadFile(fallback)
+	if err != nil {
+		return "", false
+	}
+	var m map[string]string
+	if json.Unmarshal(b, &m) != nil {
+		return "", false
+	}
+	return m["value"], false
 }
 
 // loadRefreshToken returns the stored token and whether it came from the
