@@ -149,11 +149,18 @@ func listTracks(ctx context.Context, rdb *redis.Client) ([]item, error) {
 			return nil, err
 		}
 		dur, _ := strconv.ParseFloat(h["duration"], 64)
+		// A missing or unparseable added_at sorts oldest (zero time), which is
+		// the safe default for Recent - it never displaces a track with a
+		// real timestamp.
+		addedAt, _ := time.Parse(time.RFC3339, h["added_at"])
 		items = append(items, item{
 			title:    cmp.Or(h["title"], filepath.Base(h["path"])),
 			desc:     cmp.Or(h["artist"], "Unknown artist"),
+			album:    h["album"],
+			tags:     h["tags"],
 			path:     h["path"],
 			duration: dur,
+			addedAt:  addedAt,
 		})
 	}
 	return items, nil

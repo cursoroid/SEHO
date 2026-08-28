@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -72,6 +73,10 @@ type UI struct {
 	paused                       bool
 	vol                          int
 	nowTitle, nowArtist, nowPath string
+
+	// userStopped marks a deliberate stop (currently: quitting) so the
+	// end-file it produces does not trigger auto-advance.
+	userStopped bool
 }
 
 func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
@@ -91,7 +96,11 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 		SetSelectedTextColor(mocha.Base).
 		SetSelectedBackgroundColor(mocha.Mauve)
 	for _, s := range sidebarSections {
-		u.sidebar.AddItem(s, "", 0, nil)
+		s := s
+		u.sidebar.AddItem(s, "", 0, func() {
+			u.filterBySection(s)
+			u.app.SetFocus(u.table)
+		})
 	}
 
 	u.table = tview.NewTable().SetFixed(1, 0).SetSelectable(true, false)
@@ -254,18 +263,72 @@ func (u *UI) applyFilter(query string) {
 }
 
 // resyncPlaying re-points u.playing at the currently loaded track after u.shown
-// is rebuilt, or -1 when it is no longer visible.
+// is rebuilt, or -1 when it is no longer visible. groupBy rows are skipped: a
+// group pseudo-row carries a representative track's real path (so it can be
+// played), but it is not itself the playing track, and matching it here would
+// misdirect n/p and advance() into the grouped list by coincidence of path.
 func (u *UI) resyncPlaying(path string) {
 	u.playing = -1
 	if path == "" {
 		return
 	}
 	for i, it := range u.shown {
+		if it.group {
+			continue
+		}
 		if it.path == path {
 			u.playing = i
 			return
 		}
 	}
+}
+
+// filterBySection narrows the table. Artists/Albums/Tags collapse the library
+// to one row per distinct value; picking one is a second filter step handled
+// by the search field, so there is no nested navigation state.
+func (u *UI) filterBySection(section string) {
+	switch section {
+	case "All Tracks":
+		u.setTracks(u.all)
+	case "Recent":
+		// listTracks sorts by Redis key (the file path), not recency, so
+		// Recent sorts a copy by added_at and takes the newest 50.
+		recent := slices.Clone(u.all)
+		slices.SortStableFunc(recent, func(a, b item) int {
+			return b.addedAt.Compare(a.addedAt) // newest first
+		})
+		if len(recent) > 50 {
+			recent = recent[:50]
+		}
+		u.setTracks(recent)
+	case "Artists", "Albums", "Tags":
+		u.setTracks(groupBy(u.all, section))
+	}
+	u.table.SetTitle(fmt.Sprintf(" TRACKS · %s ", section))
+}
+
+// groupBy collapses the library to one representative row per distinct value,
+// so the table can act as a browse index without a second widget.
+func groupBy(all []item, section string) []item {
+	seen := map[string]bool{}
+	out := make([]item, 0, 64)
+	for _, it := range all {
+		var k string
+		switch section {
+		case "Artists":
+			k = it.desc
+		case "Albums":
+			k = it.album
+		case "Tags":
+			k = it.tags
+		}
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, item{title: k, desc: section, path: it.path, duration: it.duration, group: true})
+	}
+	return out
 }
 
 func (u *UI) refreshHeader() {
@@ -289,12 +352,27 @@ func (u *UI) playRow(row int) {
 	u.playing = row
 	u.nowTitle, u.nowArtist, u.nowPath = u.shown[row].title, u.shown[row].desc, u.shown[row].path
 	u.pos, u.dur = 0, u.shown[row].duration
+	u.userStopped = false
 	if err := u.pl.Load(u.shown[row].path); err != nil {
 		u.setStatus(fmt.Sprintf("[%s]playback failed: %v", mocha.Red.String(), err))
 		return
 	}
 	u.table.Select(row+1, 0)
 	u.drawCard(u.shown[row])
+}
+
+// advance plays the next row in the queue (u.shown), or parks at the end of
+// the list. Called only from inside pumpEvents' QueueUpdateDraw closure -
+// playRow, and therefore pl.Load, must run on the tview event-loop goroutine.
+func (u *UI) advance() {
+	next := u.playing + 1
+	if next >= len(u.shown) {
+		u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
+		u.playing = -1
+		u.drawCard(item{})
+		return
+	}
+	u.playRow(next)
 }
 
 const (
@@ -425,9 +503,22 @@ func (u *UI) pumpEvents() {
 				u.vol = int(ev.Num)
 			case "end-file":
 				u.pos = 0
-				if ev.Reason == "error" {
+				// "stop" fires when a track is replaced deliberately (playRow's
+				// Load ends whatever was playing before it) - never advance for
+				// that, or a manual track change would double-advance past the
+				// row the user actually picked. Only "eof" (played out) and
+				// "error" (unplayable) should walk the queue forward.
+				switch ev.Reason {
+				case "error":
 					u.setStatus(fmt.Sprintf("[%s]could not play %s", mocha.Red.String(), u.nowTitle))
+					if !u.userStopped {
+						u.advance()
+					}
 					return
+				case "eof":
+					if !u.userStopped {
+						u.advance()
+					}
 				}
 			case "disconnected":
 				u.setStatus(fmt.Sprintf("[%s]lost connection to mpv", mocha.Red.String()))
@@ -504,6 +595,7 @@ func (u *UI) bindKeys() {
 			u.openSearch()
 			return nil
 		case 'q':
+			u.userStopped = true
 			u.app.Stop()
 			return nil
 		case 's':

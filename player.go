@@ -216,7 +216,6 @@ func (p *Player) Load(path string) error   { return p.send("loadfile", path, "re
 func (p *Player) TogglePause() error       { return p.post("cycle", "pause") }
 func (p *Player) Seek(delta float64) error { return p.post("seek", delta, "relative") }
 func (p *Player) SetVolume(v int) error    { return p.post("set_property", "volume", clampVol(v)) }
-func (p *Player) Stop() error              { return p.send("stop") }
 
 func (p *Player) Close() error {
 	p.once.Do(func() {

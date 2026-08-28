@@ -8,13 +8,16 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 type item struct {
-	title, desc, path string
-	duration          float64
+	title, desc, album, tags, path string
+	duration                       float64
+	addedAt                        time.Time
+	group                          bool // true for a groupBy pseudo-row; never "the playing track"
 }
 
 // setupLog sends log output to logs/seho.log, or nowhere if that is not writable.
