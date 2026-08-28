@@ -17,7 +17,8 @@ type item struct {
 	title, desc, album, tags, path string
 	duration                       float64
 	addedAt                        time.Time
-	group                          bool // true for a groupBy pseudo-row; never "the playing track"
+	group                          bool   // true for a groupBy pseudo-row; never "the playing track"
+	groupField                     string // when group: which field it was grouped on ("Artists"/"Albums"/"Tags")
 }
 
 // setupLog sends log output to logs/seho.log, or nowhere if that is not writable.

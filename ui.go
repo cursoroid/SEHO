@@ -284,51 +284,88 @@ func (u *UI) resyncPlaying(path string) {
 }
 
 // filterBySection narrows the table. Artists/Albums/Tags collapse the library
-// to one row per distinct value; picking one is a second filter step handled
-// by the search field, so there is no nested navigation state.
+// to one row per distinct value; picking one is a second filter step (see
+// filterByGroup) handled by selecting a row, so there is no nested
+// navigation state - the sidebar is filter-only, never a drill-down that plays.
 func (u *UI) filterBySection(section string) {
 	switch section {
 	case "All Tracks":
 		u.setTracks(u.all)
 	case "Recent":
-		// listTracks sorts by Redis key (the file path), not recency, so
-		// Recent sorts a copy by added_at and takes the newest 50.
-		recent := slices.Clone(u.all)
-		slices.SortStableFunc(recent, func(a, b item) int {
-			return b.addedAt.Compare(a.addedAt) // newest first
-		})
-		if len(recent) > 50 {
-			recent = recent[:50]
-		}
-		u.setTracks(recent)
+		u.setTracks(recentTracks(u.all, 50))
 	case "Artists", "Albums", "Tags":
 		u.setTracks(groupBy(u.all, section))
 	}
 	u.table.SetTitle(fmt.Sprintf(" TRACKS · %s ", section))
 }
 
+// recentTracks returns the newest n items by added_at, newest first.
+// listTracks sorts by Redis key (the file path), not recency, so this sorts
+// a copy rather than trusting item order. A missing or unparseable added_at
+// is the zero time and sorts last.
+func recentTracks(all []item, n int) []item {
+	out := slices.Clone(all)
+	slices.SortStableFunc(out, func(a, b item) int {
+		return b.addedAt.Compare(a.addedAt) // newest first
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
+// groupKey returns an item's key under one grouping field ("Artists",
+// "Albums", or "Tags"), applying the same fallback groupBy uses for an empty
+// value so filterByGroup can match back to exactly what was grouped.
+func groupKey(it item, field string) string {
+	switch field {
+	case "Artists":
+		return it.desc
+	case "Albums":
+		if it.album == "" {
+			return "Unknown album"
+		}
+		return it.album
+	case "Tags":
+		return it.tags
+	}
+	return ""
+}
+
 // groupBy collapses the library to one representative row per distinct value,
-// so the table can act as a browse index without a second widget.
+// so the table can act as a browse index without a second widget. Each
+// pseudo-row carries group=true plus the field it was grouped on, so
+// selecting one can filter back to the matching real tracks (filterByGroup)
+// instead of being mistaken for a playable track.
 func groupBy(all []item, section string) []item {
 	seen := map[string]bool{}
 	out := make([]item, 0, 64)
 	for _, it := range all {
-		var k string
-		switch section {
-		case "Artists":
-			k = it.desc
-		case "Albums":
-			k = it.album
-		case "Tags":
-			k = it.tags
-		}
+		k := groupKey(it, section)
 		if k == "" || seen[k] {
 			continue
 		}
 		seen[k] = true
-		out = append(out, item{title: k, desc: section, path: it.path, duration: it.duration, group: true})
+		out = append(out, item{
+			title: k, desc: section, path: it.path, duration: it.duration,
+			group: true, groupField: section,
+		})
 	}
 	return out
+}
+
+// filterByGroup narrows the table to the real tracks matching one group
+// value (an artist, album, or tag) picked from a grouped sidebar view. It
+// never plays anything - the sidebar/group rows are filter-only.
+func (u *UI) filterByGroup(field, key string) {
+	out := make([]item, 0, 16)
+	for _, it := range u.all {
+		if groupKey(it, field) == key {
+			out = append(out, it)
+		}
+	}
+	u.setTracks(out)
+	u.table.SetTitle(fmt.Sprintf(" TRACKS · %s ", key))
 }
 
 func (u *UI) refreshHeader() {
@@ -361,12 +398,35 @@ func (u *UI) playRow(row int) {
 	u.drawCard(u.shown[row])
 }
 
+// nextPlayIndex is the pure index arithmetic behind advance(): what to play
+// next given current (u.playing: -1 when the playing track, if any, is not
+// visible in this view or nothing is playing at all) and length (len(u.shown)).
+// ok is false when there is nothing to advance to - either current is
+// already -1, or the queue is exhausted - and current is deliberately never
+// treated as "start from the top" in that case.
+func nextPlayIndex(current, length int) (next int, ok bool) {
+	if current < 0 || current+1 >= length {
+		return -1, false
+	}
+	return current + 1, true
+}
+
 // advance plays the next row in the queue (u.shown), or parks at the end of
 // the list. Called only from inside pumpEvents' QueueUpdateDraw closure -
 // playRow, and therefore pl.Load, must run on the tview event-loop goroutine.
+//
+// When u.playing is already -1 (nothing playing, or the playing track is not
+// visible in the current view - e.g. the user switched to a grouped view
+// mid-playback) this is a deliberate no-op: there is no way to know which row
+// "next" means, so auto-advance simply pauses until the playing track is
+// visible again. It does not snapshot a separate queue to work around this -
+// the visible list is the queue, by design.
 func (u *UI) advance() {
-	next := u.playing + 1
-	if next >= len(u.shown) {
+	if u.playing < 0 {
+		return
+	}
+	next, ok := nextPlayIndex(u.playing, len(u.shown))
+	if !ok {
 		u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
 		u.playing = -1
 		u.drawCard(item{})
@@ -565,7 +625,21 @@ func (u *UI) closeSearch(clear bool) {
 }
 
 func (u *UI) bindKeys() {
-	u.table.SetSelectedFunc(func(row, _ int) { u.playRow(row - 1) })
+	u.table.SetSelectedFunc(func(row, _ int) {
+		idx := row - 1
+		if idx < 0 || idx >= len(u.shown) {
+			return
+		}
+		// The sidebar is filter-only, never a drill-down: picking a group row
+		// (an artist/album/tag) narrows the table to its real tracks rather
+		// than playing the pseudo-row's representative file under fake
+		// metadata (it would otherwise read e.g. "AC/DC · Artists").
+		if it := u.shown[idx]; it.group {
+			u.filterByGroup(it.groupField, it.title)
+			return
+		}
+		u.playRow(idx)
+	})
 
 	u.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 		// Let the search field consume everything except escape.
@@ -605,9 +679,15 @@ func (u *UI) bindKeys() {
 			u.pl.TogglePause()
 			return nil
 		case 'n':
+			if u.playing < 0 {
+				return nil
+			}
 			u.playRow(u.playing + 1)
 			return nil
 		case 'p':
+			if u.playing < 0 {
+				return nil
+			}
 			u.playRow(u.playing - 1)
 			return nil
 		case '-':
