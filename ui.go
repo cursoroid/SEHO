@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -11,45 +12,6 @@ import (
 	"github.com/rivo/tview"
 	"github.com/sahilm/fuzzy"
 )
-
-// Catppuccin Mocha. Do not add shades that are not in this struct.
-var mocha = struct {
-	Base, Mantle, Surface1, Surface2, Overlay0         tcell.Color
-	Text, Subtext0, Mauve, Green, Red, Peach, Lavender tcell.Color
-}{
-	Base:     tcell.GetColor("#1e1e2e"),
-	Mantle:   tcell.GetColor("#181825"),
-	Surface1: tcell.GetColor("#45475a"),
-	Surface2: tcell.GetColor("#585b70"),
-	Overlay0: tcell.GetColor("#6c7086"),
-	Text:     tcell.GetColor("#cdd6f4"),
-	Subtext0: tcell.GetColor("#a6adc8"),
-	Mauve:    tcell.GetColor("#cba6f7"),
-	Green:    tcell.GetColor("#a6e3a1"),
-	Red:      tcell.GetColor("#f38ba8"),
-	Peach:    tcell.GetColor("#fab387"),
-	Lavender: tcell.GetColor("#b4befe"),
-}
-
-func applyTheme() {
-	tview.Styles = tview.Theme{
-		PrimitiveBackgroundColor:    mocha.Base,
-		ContrastBackgroundColor:     mocha.Surface2,
-		MoreContrastBackgroundColor: mocha.Surface1,
-		// Accepted gap: the palette design calls for a mauve *focused* border,
-		// but tview v0.42's Theme has a single BorderColor with no separate
-		// focus variant, so it stays surface1 in both states. Focus is
-		// signalled by tview's built-in double-line border rune set instead.
-		BorderColor:                mocha.Surface1,
-		TitleColor:                 mocha.Lavender,
-		GraphicsColor:              mocha.Surface1,
-		PrimaryTextColor:           mocha.Text,
-		SecondaryTextColor:         mocha.Subtext0,
-		TertiaryTextColor:          mocha.Overlay0,
-		InverseTextColor:           mocha.Base,
-		ContrastSecondaryTextColor: mocha.Mauve,
-	}
-}
 
 var sidebarSections = []string{"All Tracks", "Artists", "Albums", "Tags", "Recent"}
 
@@ -116,8 +78,7 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 		s := s
 		u.sidebar.AddItem(s, "", 0, func() {
 			u.filterBySection(s)
-			u.focusedSidebar = false
-			u.app.SetFocus(u.table)
+			u.focus(u.table)
 		})
 	}
 
@@ -143,16 +104,20 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 		u.closeSearch(key == tcell.KeyEscape)
 	})
 
-	u.body = tview.NewFlex().
-		AddItem(u.sidebar, 16, 0, false).
-		AddItem(u.table, 0, 1, true).
-		AddItem(u.card, 32, 0, false)
-
+	u.body = tview.NewFlex()
 	u.root = tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(u.header, 3, 0, false).
+		AddItem(u.header, headerRows, 0, false).
+		AddItem(gutter(), 1, 0, false).
 		AddItem(u.body, 0, 1, true).
-		AddItem(u.transport, 4, 0, false).
+		AddItem(gutter(), 1, 0, false).
+		AddItem(u.transport, transportRows, 0, false).
 		AddItem(u.footer, 1, 0, false)
+
+	// The panes fill themselves with base; the ground behind them is crust,
+	// one step darker. That contrast - not the rounded corners - is what makes
+	// them read as floating, and it is only visible through the gutters.
+	u.root.SetBackgroundColor(mocha.Crust)
+	u.body.SetBackgroundColor(mocha.Crust)
 
 	u.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
 		w, _ := screen.Size()
@@ -160,7 +125,8 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 		return false // false = let tview draw normally
 	})
 
-	u.app.SetRoot(u.root, true).SetFocus(u.table)
+	u.app.SetRoot(u.root, true)
+	u.focus(u.table)
 	return u
 }
 
@@ -183,12 +149,15 @@ func (u *UI) relayout(width int) {
 
 	u.body.Clear()
 	switch {
-	case width >= 110:
-		u.body.AddItem(u.sidebar, 16, 0, false).
+	case width >= cardBreakpoint:
+		u.body.AddItem(u.sidebar, sidebarCols, 0, false).
+			AddItem(gutter(), 1, 0, false).
 			AddItem(u.table, 0, 1, true).
-			AddItem(u.card, 32, 0, false)
+			AddItem(gutter(), 1, 0, false).
+			AddItem(u.card, cardCols, 0, false)
 	case width >= 80:
-		u.body.AddItem(u.sidebar, 16, 0, false).
+		u.body.AddItem(u.sidebar, sidebarCols, 0, false).
+			AddItem(gutter(), 1, 0, false).
 			AddItem(u.table, 0, 1, true)
 	default:
 		u.body.AddItem(u.table, 0, 1, true)
@@ -203,7 +172,7 @@ func (u *UI) relayout(width int) {
 	// the TextView's text here is fine even though relayout runs inside
 	// SetBeforeDrawFunc with the app lock held; see the focus fix-up below for
 	// what is NOT safe to call from here.
-	if width >= 110 && u.nowPath != "" {
+	if width >= cardBreakpoint && u.nowPath != "" {
 		u.drawCard(itemByPath(u.all, u.nowPath))
 	}
 
@@ -215,7 +184,7 @@ func (u *UI) relayout(width int) {
 	// tracked copy, and the fix-up is dispatched to run after draw() returns.
 	if u.focusedSidebar && width < 80 {
 		u.focusedSidebar = false
-		go u.app.QueueUpdateDraw(func() { u.app.SetFocus(u.table) })
+		go u.app.QueueUpdateDraw(func() { u.focus(u.table) })
 	}
 
 	u.setFooter()
@@ -236,11 +205,35 @@ func textPane(s string) *tview.TextView {
 // paintTableHeader writes the column header row. Shared with the search view.
 func (u *UI) paintTableHeader() {
 	for c, h := range []string{"#", "TITLE", "ARTIST", "TIME"} {
+		// The "#" column stays a bare glyph - letter-spacing a single
+		// character just looks like a stray mark.
+		if c > 0 {
+			h = smallCaps(h)
+		}
 		u.table.SetCell(0, c, tview.NewTableCell(h).
 			SetTextColor(mocha.Overlay0).
 			SetSelectable(false).
 			SetExpansion(map[int]int{0: 0, 1: 3, 2: 2, 3: 0}[c]))
 	}
+}
+
+// numberCell renders the leftmost column: a marker on the track that is
+// actually playing, otherwise its position in the list. Without this there is
+// no way to tell what is playing from what is merely selected once you browse
+// away from it.
+func (u *UI) numberCell(row int, it item) *tview.TableCell {
+	if !it.group && it.path != "" && it.path == u.nowPath {
+		return cell("▶", mocha.Mauve)
+	}
+	return cell(fmt.Sprintf("%d", row+1), mocha.Overlay0)
+}
+
+// titleColor lifts the playing row out of the list.
+func (u *UI) titleColor(it item) tcell.Color {
+	if !it.group && it.path != "" && it.path == u.nowPath {
+		return mocha.Mauve
+	}
+	return mocha.Text
 }
 
 func (u *UI) setTracks(items []item) {
@@ -250,8 +243,8 @@ func (u *UI) setTracks(items []item) {
 	u.paintTableHeader()
 
 	for i, it := range items {
-		u.table.SetCell(i+1, 0, cell(fmt.Sprintf("%d", i+1), mocha.Overlay0))
-		u.table.SetCell(i+1, 1, cell(tview.Escape(it.title), mocha.Text))
+		u.table.SetCell(i+1, 0, u.numberCell(i, it))
+		u.table.SetCell(i+1, 1, cell(tview.Escape(it.title), u.titleColor(it)))
 		u.table.SetCell(i+1, 2, cell(tview.Escape(it.desc), mocha.Subtext0))
 		u.table.SetCell(i+1, 3, cell(fmtDuration(it.duration), mocha.Subtext0))
 	}
@@ -339,8 +332,8 @@ func (u *UI) applyFilter(query string) {
 			}
 		}
 
-		u.table.SetCell(row+1, 0, cell(fmt.Sprintf("%d", row+1), mocha.Overlay0))
-		u.table.SetCell(row+1, 1, cell(highlight(it.title, titleHits), mocha.Text))
+		u.table.SetCell(row+1, 0, u.numberCell(row, it))
+		u.table.SetCell(row+1, 1, cell(highlight(it.title, titleHits), u.titleColor(it)))
 		u.table.SetCell(row+1, 2, cell(highlight(it.desc, artistHits), mocha.Subtext0))
 		u.table.SetCell(row+1, 3, cell(fmtDuration(it.duration), mocha.Subtext0))
 	}
@@ -479,11 +472,32 @@ func padWidth(w int, parts ...string) int {
 
 // refreshHeader right-aligns the track count to the pane's actual width.
 func (u *UI) refreshHeader() {
-	label := fmt.Sprintf("%d tracks", len(u.all))
 	_, _, w, _ := u.header.GetInnerRect()
-	pad := padWidth(w, "  SEHO", label)
-	u.header.SetText(fmt.Sprintf("  [%s::b]SEHO[-::-]%*s[%s]%d tracks",
-		mocha.Lavender.String(), pad, "", mocha.Subtext0.String(), len(u.all)))
+	if w <= 0 {
+		return
+	}
+	label := fmt.Sprintf("%d tracks", len(u.all))
+
+	// Below the wordmark's own width plus room for the count, fall back to
+	// plain text rather than rendering a clipped, unreadable banner.
+	if w < wordmarkWidth()+len(label)+8 {
+		u.header.SetText(fmt.Sprintf("  [%s::b]SEHO[-::-]%*s[%s]%s  ",
+			mocha.Lavender.String(), padWidth(w, "  SEHO", label+"  "), "",
+			mocha.Subtext0.String(), label))
+		return
+	}
+
+	// The wordmark is a baked constant, not user data, and contains no '[',
+	// so it needs no escaping - see theme.go.
+	rows := make([]string, len(wordmark))
+	for i, line := range wordmark {
+		rows[i] = fmt.Sprintf("  [%s]%s", mocha.Lavender.String(), line)
+		if i == 0 {
+			rows[i] += fmt.Sprintf("%*s[%s]%s  ",
+				padWidth(w, "  "+line, label+"  "), "", mocha.Subtext0.String(), label)
+		}
+	}
+	u.header.SetText(strings.Join(rows, "\n"))
 }
 
 func (u *UI) playRow(row int) {
@@ -502,7 +516,22 @@ func (u *UI) playRow(row int) {
 		return
 	}
 	u.table.Select(row+1, 0)
+	u.repaintMarkers()
 	u.drawCard(u.shown[row])
+}
+
+// repaintMarkers refreshes the playing indicator and row colour in place.
+//
+// It deliberately rewrites only column 0's text and column 1's *colour*:
+// applyFilter builds column 1 with search-match highlighting baked into the
+// string, and regenerating that text here would silently destroy it.
+func (u *UI) repaintMarkers() {
+	for i, it := range u.shown {
+		u.table.SetCell(i+1, 0, u.numberCell(i, it))
+		if c := u.table.GetCell(i+1, 1); c != nil {
+			c.SetTextColor(u.titleColor(it))
+		}
+	}
 }
 
 // firstPlayableRow returns the index of the first non-group row in shown, or
@@ -580,56 +609,173 @@ func itemByPath(items []item, path string) item {
 // drawCard paints the NOW PLAYING card: embedded album art (or a fallback
 // tile) plus the track's title and artist beneath it.
 func (u *UI) drawCard(it item) {
-	if it.path == "" || u.layoutWidth < 110 {
+	if it.path == "" || u.layoutWidth < cardBreakpoint {
 		u.card.SetText("")
 		return
 	}
-	art := AlbumArt(it.path, it.album, artCells, artRows)
-	u.card.SetText(fmt.Sprintf("\n%s\n  [%s::b]%s[-::-]\n  [%s]%s",
-		art, mocha.Text.String(), tview.Escape(it.title), mocha.Subtext0.String(), tview.Escape(it.desc)))
+	_, _, w, h := u.card.GetInnerRect()
+
+	meta := fmt.Sprintf("  [%s::b]%s[-::-]\n  [%s]%s",
+		mocha.Text.String(), tview.Escape(it.title),
+		mocha.Subtext0.String(), tview.Escape(it.desc))
+
+	// Reserve four rows the art cannot have: the blank above it, the blank
+	// below it, and the two metadata lines. The art is
+	// square - one cell row is two pixels tall - so its width tracks whichever
+	// of height or width runs out first, rather than sitting at a fixed size
+	// that the pane may no longer have room for.
+	rows := min(artRows, h-4)
+	cells := min(artCells, w-2)
+	if cells > rows*2 {
+		cells = rows * 2
+	} else {
+		rows = cells / 2
+	}
+	if rows < 4 || cells < 8 {
+		// Too cramped for a legible image; the metadata is worth more.
+		u.card.SetText("\n" + meta)
+		return
+	}
+
+	indent := strings.Repeat(" ", max(0, (w-cells)/2))
+	art := AlbumArt(it.path, it.album, cells, rows)
+	lines := strings.Split(strings.TrimRight(art, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = indent + l
+	}
+	u.card.SetText("\n" + strings.Join(lines, "\n") + "\n\n" + meta)
 }
 
-// progressBar renders a width-cell bar. Exactly width runes of content,
-// with a knob at the boundary.
-func progressBar(frac float64, width int) string {
+const (
+	headerRows     = 5   // 3 wordmark rows plus the border
+	transportRows  = 5   // cluster, title, bar, plus the border
+	cardBreakpoint = 110 // below this the card is not in the layout
+	sidebarCols    = 16
+	cardCols       = 32
+	volMeterCells  = 10
+)
+
+// focus moves keyboard focus and recolours the pane borders to match.
+//
+// tview's Theme has a single BorderColor with no focus variant, which is why
+// an earlier pass recorded a mauve focused border as unachievable. That was
+// wrong: Box.SetBorderColor is per-widget, so the accent is applied here. The
+// focused border rune set is deliberately identical to the unfocused one (see
+// applyTheme) so colour is the only signal.
+//
+// Never call this from relayout: it runs inside SetBeforeDrawFunc while
+// Application.draw() holds the app lock, and SetFocus takes that same lock.
+func (u *UI) focus(p tview.Primitive) {
+	u.focusedSidebar = p == tview.Primitive(u.sidebar)
+	border := func(b *tview.Box, active bool) {
+		if active {
+			b.SetBorderColor(mocha.Mauve)
+			return
+		}
+		b.SetBorderColor(mocha.Surface0)
+	}
+	border(u.sidebar.Box, u.focusedSidebar)
+	border(u.table.Box, p == tview.Primitive(u.table))
+	u.app.SetFocus(p)
+}
+
+const (
+	cometTail       = 3    // cells behind the head that ramp toward peach
+	shimmerTail     = 2.5  // half-width of the travelling highlight, in cells
+	shimmerStrength = 0.55 // how far the highlight blends toward text colour
+	shimmerSpeed    = 8.0  // cells the highlight travels per second of playback
+)
+
+// eighths indexes partial-cell fills, 0/8 through 8/8.
+var eighths = []rune(" ▏▎▍▌▋▊▉█")
+
+// barCellColor is the colour of one filled cell: a mauve-to-pink gradient along
+// the bar, ramped toward peach near the head, brightened where the shimmer is.
+func barCellColor(i, full, width int, shimmer float64) string {
+	c := lerpHex(mocha.Mauve, mocha.Pink, float64(i)/float64(max(1, width-1)))
+	if d := full - i; d <= cometTail {
+		c = lerpHex(tcell.GetColor(c), mocha.Peach, 1-float64(d)/float64(cometTail+1))
+	}
+	if d := math.Abs(float64(i) - shimmer); d < shimmerTail {
+		c = lerpHex(tcell.GetColor(c), mocha.Text, (1-d/shimmerTail)*shimmerStrength)
+	}
+	return c
+}
+
+// progressBar renders a width-cell bar at sub-cell precision — eighth-blocks
+// give eight times the horizontal resolution of a whole-cell bar, so the head
+// glides instead of stepping.
+//
+// The animation is a pure function of phase, which the caller derives from
+// elapsed playback rather than a wall clock. mpv emits time-pos at roughly
+// 16Hz while playing and not at all while paused, so this needs no ticker, no
+// goroutine, costs nothing when idle, and freezes mid-stride on pause by
+// itself — which is also the correct feedback.
+func progressBar(frac float64, width int, phase float64) string {
+	if width <= 0 {
+		return ""
+	}
 	if frac < 0 {
 		frac = 0
 	}
 	if frac > 1 {
 		frac = 1
 	}
-	fill := int(frac*float64(width) + 0.5)
-	knob := ""
-	if fill > 0 && fill < width {
-		knob = "●"
-	}
-	body := strings.Repeat("━", fill)
-	if knob != "" {
-		body = strings.Repeat("━", fill-1) + knob
-	}
-	return fmt.Sprintf("[%s]%s[%s]%s",
-		mocha.Mauve.String(), body,
-		mocha.Surface1.String(), strings.Repeat("─", width-fill))
-}
 
-// volMeter scales glyphs against 100 (not mpv's 130% overdrive ceiling) so the
-// default volume lights every glyph; values above 100 just show a full meter.
-// The numeric percentage shown alongside stays exact.
-func volMeter(v int) string {
-	bars := []rune("▁▃▅▇")
-	n := min(len(bars), max(0, v*len(bars)/100))
-	out := make([]rune, 0, len(bars))
-	for i := range bars {
-		if i < n {
-			out = append(out, bars[i])
-		} else {
-			out = append(out, '·')
+	exact := frac * float64(width)
+	full := min(int(exact), width)
+	rem := int((exact - float64(full)) * 8)
+	shimmer := math.Mod(phase, float64(width)+shimmerTail*2) - shimmerTail
+
+	var b strings.Builder
+	b.Grow(width * 16)
+	for i := 0; i < width; i++ {
+		switch {
+		case i < full:
+			fmt.Fprintf(&b, "[%s]█", barCellColor(i, full, width, shimmer))
+		case i == full && rem > 0:
+			fmt.Fprintf(&b, "[%s]%c", mocha.Peach.String(), eighths[rem])
+		default:
+			fmt.Fprintf(&b, "[%s]░", mocha.Surface0.String())
 		}
 	}
-	return string(out)
+	return b.String()
+}
+
+// volMeter renders volume across cells at sub-cell precision. mpv accepts up
+// to 130%, but the meter is scaled to 100 so a normal full volume actually
+// looks full; anything above simply stays topped out while the numeric
+// percentage beside it stays exact.
+func volMeter(v, cells int) string {
+	if cells <= 0 {
+		return ""
+	}
+	f := min(1.0, max(0.0, float64(v)/100))
+	exact := f * float64(cells)
+	full := min(int(exact), cells)
+	rem := int((exact - float64(full)) * 8)
+
+	var b strings.Builder
+	b.Grow(cells * 12)
+	for i := 0; i < cells; i++ {
+		switch {
+		case i < full:
+			fmt.Fprintf(&b, "[%s]█", mocha.Peach.String())
+		case i == full && rem > 0:
+			fmt.Fprintf(&b, "[%s]%c", mocha.Peach.String(), eighths[rem])
+		default:
+			fmt.Fprintf(&b, "[%s]░", mocha.Surface0.String())
+		}
+	}
+	return b.String()
 }
 
 func (u *UI) drawTransport() {
+	_, _, w, _ := u.transport.GetInnerRect()
+	if w <= 0 {
+		return
+	}
+
 	icon, iconColor := "▶", mocha.Green
 	if u.paused {
 		icon, iconColor = "⏸", mocha.Red
@@ -638,36 +784,39 @@ func (u *UI) drawTransport() {
 		icon, iconColor = "■", mocha.Overlay0
 	}
 
+	// Row 1: transport cluster on the left, volume on the right. The prev/next
+	// glyphs are indicators, not controls - this is a keyboard-only UI - so
+	// they sit in subtext and only the current state is coloured.
+	cluster := fmt.Sprintf("  [%s]⏮  [%s]%s[-]  [%s]⏭",
+		mocha.Overlay0.String(), iconColor.String(), icon, mocha.Overlay0.String())
+	vol := fmt.Sprintf("%s [%s]%3d%%  ", volMeter(u.vol, volMeterCells), mocha.Subtext0.String(), u.vol)
+	line1 := cluster + strings.Repeat(" ", padWidth(w, cluster, vol)) + vol
+
+	// Row 2: what is playing. Only emit the separator when there is an artist,
+	// otherwise the idle line reads "nothing playing ·" with a dangling middot.
 	title := u.nowTitle
 	if title == "" {
 		title = "nothing playing"
 	}
-
-	// Only emit the "· artist" separator when there is an artist - otherwise
-	// idle playback reads "■  nothing playing ·" with a dangling middot.
-	left := fmt.Sprintf("  [%s]%s[-]  [%s::b]%s[-::-]",
-		iconColor.String(), icon, mocha.Text.String(), tview.Escape(title))
+	line2 := fmt.Sprintf("  [%s::b]%s[-::-]", mocha.Text.String(), tview.Escape(title))
 	if u.nowArtist != "" {
-		left += fmt.Sprintf(" [%s]· %s[-]", mocha.Subtext0.String(), tview.Escape(u.nowArtist))
+		line2 += fmt.Sprintf(" [%s]· %s[-]", mocha.Subtext0.String(), tview.Escape(u.nowArtist))
 	}
 
-	right := fmt.Sprintf("[%s]vol %s %d%%", mocha.Peach.String(), volMeter(u.vol), u.vol)
-
-	_, _, w, _ := u.transport.GetInnerRect()
-	pad := padWidth(w, left, right)
-	line1 := left + strings.Repeat(" ", pad) + right
-
+	// Row 3: elapsed, bar, duration. The shimmer phase comes from elapsed
+	// playback, so the animation rides mpv's time-pos events and stops when
+	// they stop.
 	frac := 0.0
 	if u.dur > 0 {
 		frac = u.pos / u.dur
 	}
-	barWidth := max(10, w-24)
-	line2 := fmt.Sprintf("  [%s]%s [-]%s[%s] %s",
+	barWidth := max(10, w-20)
+	line3 := fmt.Sprintf("  [%s]%s [-]%s[%s] %s",
 		mocha.Subtext0.String(), fmtDuration(u.pos),
-		progressBar(frac, barWidth),
+		progressBar(frac, barWidth, u.pos*shimmerSpeed),
 		mocha.Subtext0.String(), fmtDuration(u.dur))
 
-	u.transport.SetText(line1 + "\n" + line2)
+	u.transport.SetText(line1 + "\n" + line2 + "\n" + line3)
 }
 
 func (u *UI) setStatus(markup string) { u.transport.SetText("  " + markup) }
@@ -779,8 +928,7 @@ func (u *UI) closeSearch(clear bool) {
 	if clear {
 		u.applyFilter("")
 	}
-	u.focusedSidebar = false
-	u.app.SetFocus(u.table)
+	u.focus(u.table)
 }
 
 func (u *UI) bindKeys() {
@@ -875,13 +1023,11 @@ func (u *UI) cycleFocus(dir int) {
 	for i, p := range order {
 		if p == cur {
 			next := order[(i+len(order)+dir)%len(order)]
-			u.focusedSidebar = next == u.sidebar
-			u.app.SetFocus(next)
+			u.focus(next)
 			return
 		}
 	}
-	u.focusedSidebar = false
-	u.app.SetFocus(u.table)
+	u.focus(u.table)
 }
 
 // scan runs off the UI goroutine; every widget touch goes through QueueUpdateDraw.
