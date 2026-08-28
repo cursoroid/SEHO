@@ -83,10 +83,20 @@ WebSocket port published on loopback - no host networking, no mDNS.
 
 ## Lossless
 
-Spotify's lossless tier carries more than 16 bits per sample. The capture format
-therefore matters: at `s16le` the extra resolution is discarded inside the
-container, before SEHO ever sees it. With `Lossless capture` enabled (the
-default) the null sink, the capture and mpv all run at 32 bits.
+Spotify's lossless tier is FLAC at up to 24 bits per sample, and Soloist's own
+CLI has no bitrate or quality option - so the depth of the capture path *is*
+SEHO's quality setting. The `Capture quality` selector on the settings page
+(shown once Soloist is ready) sets the null sink, the `parec` capture and mpv's
+demuxer together:
+
+| Setting | Format | Effect |
+|---|---|---|
+| 32-bit | `s32le` | lossless, with headroom (default) |
+| 24-bit | `s24le` | lossless, exact - a quarter less data than 32-bit |
+| 16-bit | `s16le` | CD depth; truncates a lossless stream |
+
+Changing it restarts the container, because the sink format and mpv's rawaudio
+demuxer are both fixed when they start.
 
 Soloist does not report which tier it is streaming - there is no quality field
 anywhere in its WebSocket payloads - so SEHO does not display one. What it can
@@ -97,7 +107,7 @@ guarantee is that it does not degrade the stream it is given.
 | Variable | Default | Purpose |
 |---|---|---|
 | `SOLOIST_API_KEY` | - | developer API key (required) |
-| `SEHO_FORMAT` | `s32le` | PCM sample format, `s16le` or `s32le` |
+| `SEHO_FORMAT` | `s32le` | PCM sample format, `s16le`, `s24le` or `s32le` |
 | `SEHO_RATE` | `44100` | sample rate |
 | `SEHO_WS_PORT` | `5580` | Soloist WebSocket API port |
 | `SEHO_DEVICE_NAME` | `SEHO` | Spotify Connect device name |

@@ -14,8 +14,8 @@ playback through `librespot` and an equalizer that covers both.
   responsive layout that adapts to the terminal width.
 - Spotify search, Liked Songs and playlists in the same table as the local
   library, streamed through Spotify's own Soloist client (or librespot).
-- Lossless-preserving Spotify capture: 32-bit throughout, so the extra
-  resolution of Spotify's lossless tier is not thrown away.
+- Lossless-preserving Spotify capture, with a quality selector: 16-, 24- or
+  32-bit end to end, so the resolution of Spotify's lossless tier survives.
 - A parametric equalizer with sound profiles, applied to local files and
   Spotify alike. Imports AutoEq and Equalizer APO files.
 - A settings page: music directory, Redis address, Spotify credentials,
@@ -51,7 +51,7 @@ working; a field the environment controls shows read-only on the settings page.
 | `SEHO_DEVICE_NAME` | `device_name` | `SEHO` | Name librespot advertises |
 | `SEHO_BITRATE` | `bitrate` | `320` | Spotify bitrate: 96, 160 or 320 |
 | `SEHO_SPOTIFY_BACKEND` | `spotify_backend` | `soloist` | `soloist` or `librespot` |
-| - | `lossless` | `true` | capture Spotify at 32 bits rather than 16 |
+| - | `capture_bits` | `32` | Soloist capture depth: 16, 24 or 32 |
 | - | `soloist_image` | `seho-soloist:latest` | container image to run |
 | `SOLOIST_API_KEY` | - | - | Soloist key; otherwise read from the keychain |
 

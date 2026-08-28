@@ -590,6 +590,24 @@ func (u *UI) spotify() Backend {
 	return u.spot
 }
 
+// stopSpotify tears down the Spotify backend so the next play builds a fresh
+// one. Reports whether there was anything to tear down. Used when a setting is
+// baked into the backend at spawn time and cannot be changed in place.
+func (u *UI) stopSpotify() bool {
+	u.spotMu.Lock()
+	sp := u.spot
+	u.spot = nil
+	u.spotMu.Unlock()
+	if sp == nil {
+		return false
+	}
+	sp.Close()
+	if u.active == srcSpotify {
+		u.playing, u.nowPath = -1, ""
+	}
+	return true
+}
+
 // current is the backend that owns the transport right now.
 func (u *UI) current() Backend {
 	if u.active == srcSpotify {

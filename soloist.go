@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -66,15 +67,46 @@ type SoloistBackend struct {
 	endSent  bool // guards against emitting end-file twice for one track
 }
 
-// soloistSampleFormat picks the capture format. 32 bits is the point of the
-// lossless tier: Spotify's lossless audio carries more than 16 bits, and a
-// 16-bit sink discards that before SEHO ever sees it. 16 bits stays available
-// for anyone who would rather halve the data rate.
-func soloistSampleFormat(lossless bool) string {
-	if lossless {
+// captureBits enumerates the sample depths the capture path supports, verified
+// end to end: a PulseAudio null sink and parec accept all three inside the
+// container, and mpv's rawaudio demuxer reads all three back out.
+//
+// Soloist decides the stream quality itself - its CLI exposes no bitrate or
+// quality option - so the depth SEHO captures at is the whole quality setting.
+var captureBits = []int{32, 24, 16}
+
+const captureBitsDefault = 32
+
+// soloistSampleFormat maps a capture depth to the PCM format name PulseAudio,
+// parec and mpv all share. An unknown depth falls back to the default rather
+// than failing: a hand-edited config should not stop playback.
+func soloistSampleFormat(bits int) string {
+	switch bits {
+	case 16:
+		return "s16le"
+	case 24:
+		return "s24le"
+	default:
 		return "s32le"
 	}
-	return "s16le"
+}
+
+// captureQualityLabel names a depth the way the settings page should show it.
+// Note mpv reports s24le input as format "s32": ffmpeg has no packed 24-bit
+// sample format, so the samples are unpacked into 32-bit containers. Nothing is
+// truncated - 24-bit and 32-bit capture sound identical, 24-bit just moves a
+// quarter less data between the container and mpv.
+// 24-bit is what Spotify's lossless tier actually delivers, so 16 is the only
+// option that loses anything and 32 is headroom rather than extra detail.
+func captureQualityLabel(bits int) string {
+	switch bits {
+	case 16:
+		return "16-bit · CD depth (truncates lossless)"
+	case 24:
+		return "24-bit · lossless, exact"
+	default:
+		return "32-bit · lossless, with headroom"
+	}
 }
 
 const (
@@ -98,7 +130,7 @@ func StartSoloistBackend(cfg Config, apiKey string) (*SoloistBackend, error) {
 		return nil, err
 	}
 
-	format := soloistSampleFormat(cfg.Lossless)
+	format := soloistSampleFormat(cfg.CaptureBits)
 
 	// A pipe, not a FIFO: SEHO copies the container's PCM into it, and mpv reads
 	// the other end as fd://3.
@@ -158,6 +190,8 @@ func StartSoloistBackend(cfg Config, apiKey string) (*SoloistBackend, error) {
 // run starts the container. Its stdout is the PCM stream and is copied into the
 // fifo; its stderr is Soloist's log and goes to the log file.
 func (s *SoloistBackend) run(apiKey, format string) error {
+	stopOrphanedContainers()
+
 	args := []string{
 		"run", "--rm", "--name", s.container,
 		"--platform", "linux/" + dockerArch(),
@@ -595,16 +629,59 @@ func (s *SoloistBackend) markStreaming() {
 
 // --- environment checks ----------------------------------------------------
 
-// soloistPaired reports whether Soloist has cached credentials in its data
+// stopOrphanedContainers stops containers left behind by a SEHO that was killed
+// before it could clean up. Soloist refuses to start a second session on the
+// same data directory, and the symptom - "soloist did not sign in" - points
+// nowhere near the cause, so this is worth doing before every launch.
+//
+// The container name carries the pid that started it, so a container is only
+// stopped once that process is gone: another running SEHO's container is left
+// alone. ponytail: signal 0 is the liveness test, pid reuse is not worth
+// guarding against for a name this specific.
+func stopOrphanedContainers() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "ps", "--format", "{{.Names}}",
+		"--filter", "name=seho-soloist-").Output()
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(string(out)) {
+		pid, err := strconv.Atoi(strings.TrimPrefix(name, "seho-soloist-"))
+		if err != nil || pid == os.Getpid() || processAlive(pid) {
+			continue
+		}
+		log.Printf("soloist: stopping orphaned container %s", name)
+		exec.CommandContext(ctx, "docker", "stop", "-t", "2", name).Run()
+	}
+}
+
+func processAlive(pid int) bool {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return p.Signal(syscall.Signal(0)) == nil
+}
+
+// soloistPaired reports whether Soloist has stored credentials in its data
 // volume, which is what pairing produces. Checked by listing the volume rather
 // than by starting the daemon: this runs while drawing the settings page.
+//
+// Soloist 1.3.7 keeps the reusable credential as an encrypted blob at
+// settings/Users/<user>-user/cached - not the credentials.json its docs imply,
+// which is why the earlier check reported an already-paired volume as unpaired.
+// Both paths are accepted so a future layout does not break the check again.
 func soloistPaired() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", "run", "--rm",
 		"-v", soloistDataVol+":/data", "alpine:3", "sh", "-c",
-		"ls /data/credentials.json 2>/dev/null || ls /data/*/credentials.json 2>/dev/null").CombinedOutput()
-	return err == nil && strings.Contains(string(out), "credentials.json")
+		// exit 0 regardless: ls reports failure for every pattern that does not
+		// match, so its status says nothing. A non-zero status here means docker
+		// itself failed, which must not read as "paired".
+		"ls -d /data/settings/Users/*/cached /data/credentials.json /data/*/credentials.json 2>/dev/null; exit 0").CombinedOutput()
+	return err == nil && strings.Contains(string(out), "/data/")
 }
 
 func dockerAvailable() error {

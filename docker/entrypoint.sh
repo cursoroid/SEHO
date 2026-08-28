@@ -5,7 +5,7 @@
 #
 # Environment:
 #   SOLOIST_API_KEY  developer API key (required)
-#   SEHO_FORMAT      PCM sample format, s16le or s32le (default s32le)
+#   SEHO_FORMAT      PCM sample format, s16le, s24le or s32le (default s32le)
 #   SEHO_RATE        sample rate (default 44100)
 #   SEHO_WS_PORT     WebSocket API port (default 5580)
 #   SEHO_DEVICE_NAME Spotify Connect device name (default SEHO)
@@ -25,9 +25,9 @@ fi
 export XDG_RUNTIME_DIR=/tmp/pa
 mkdir -p "$XDG_RUNTIME_DIR" /data/cache
 
-# s32le carries more than 16 bits of resolution, which is the whole point of
-# lossless playback: a 16-bit sink would quietly discard it before SEHO ever
-# sees the audio.
+# The sink depth is the quality setting: Spotify's lossless tier is FLAC up to
+# 24-bit, so an s16le sink would quietly truncate it before SEHO ever sees the
+# audio. s24le carries it exactly and s32le carries it with headroom.
 pulseaudio -n --exit-idle-time=-1 \
   --load="module-native-protocol-unix" \
   --load="module-null-sink sink_name=seho rate=${SEHO_RATE} channels=2 format=${SEHO_FORMAT}" \

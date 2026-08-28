@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -89,9 +90,24 @@ func (u *UI) showSettings() {
 		})
 	}
 
-	form.AddCheckbox("Lossless capture", set.File.Lossless, func(on bool) {
-		set.File.Lossless = on
-	})
+	// The quality selector only appears once Soloist can actually stream:
+	// offering a lossless depth while the container is unpaired would be a
+	// setting with nowhere to apply. soloistStatusLine says what is missing.
+	if set.Eff.SpotifyBackend == backendSoloist && u.soloistReady() == nil {
+		labels := make([]string, len(captureBits))
+		idx := 0
+		for i, b := range captureBits {
+			labels[i] = captureQualityLabel(b)
+			if b == set.File.CaptureBits {
+				idx = i
+			}
+		}
+		form.AddDropDown("Capture quality", labels, idx, func(_ string, i int) {
+			if i >= 0 && i < len(captureBits) {
+				set.File.CaptureBits = captureBits[i]
+			}
+		})
+	}
 
 	form.AddInputField("Soloist API key", maskKey(LoadSoloistKey()), 0, nil, func(v string) {
 		u.soloistKeyEdit = v
@@ -161,29 +177,34 @@ func maskKey(k string) string {
 	return k[:6] + "…" + k[len(k)-4:]
 }
 
+// soloistReady reports whether Soloist could stream right now, or why not. The
+// error text is what the settings page shows, so each case names its own fix.
+func (u *UI) soloistReady() error {
+	if u.set.Eff.SpotifyBackend != backendSoloist {
+		return errors.New("not in use - playback client is " + u.set.Eff.SpotifyBackend)
+	}
+	if err := dockerAvailable(); err != nil {
+		return err
+	}
+	if err := soloistImagePresent(u.set.Eff.SoloistImage); err != nil {
+		return errors.New("image missing - build it: docker build -t " + u.set.Eff.SoloistImage + " ./docker")
+	}
+	if LoadSoloistKey() == "" {
+		return errors.New("no API key - create one at developer.spotify.com and paste it above")
+	}
+	if !soloistPaired() {
+		return errors.New("not paired - see docker/README.md (one-time, needs an mDNS proxy on macOS)")
+	}
+	return nil
+}
+
 // soloistStatusLine describes the Soloist side: the container image, whether it
 // is paired, and what to do about it if not.
 func (u *UI) soloistStatusLine() string {
-	if u.set.Eff.SpotifyBackend != backendSoloist {
-		return "not in use - playback client is " + u.set.Eff.SpotifyBackend
-	}
-	if err := dockerAvailable(); err != nil {
+	if err := u.soloistReady(); err != nil {
 		return err.Error()
 	}
-	if err := soloistImagePresent(u.set.Eff.SoloistImage); err != nil {
-		return "image missing - build it: docker build -t " + u.set.Eff.SoloistImage + " ./docker"
-	}
-	if LoadSoloistKey() == "" {
-		return "no API key - create one at developer.spotify.com and paste it above"
-	}
-	if !soloistPaired() {
-		return "not paired - see docker/README.md (one-time, needs an mDNS proxy on macOS)"
-	}
-	format := "16-bit"
-	if u.set.Eff.Lossless {
-		format = "32-bit (lossless-preserving)"
-	}
-	return "ready, capturing " + format
+	return "ready, capturing " + captureQualityLabel(u.set.Eff.CaptureBits)
 }
 
 // dependencyLines reports the external programs SEHO shells out to, so a
@@ -224,6 +245,7 @@ func (u *UI) dependencyLines() string {
 func (u *UI) saveSettings() {
 	oldRedis := u.set.Eff.RedisAddr
 	oldDevice, oldBitrate := u.set.Eff.DeviceName, u.set.Eff.Bitrate
+	oldBits := u.set.Eff.CaptureBits
 
 	// Re-derive the effective values so environment overrides keep winning.
 	u.set = applyEnv(u.set.File, envLookup)
@@ -256,7 +278,13 @@ func (u *UI) saveSettings() {
 		}
 		notes = append(notes, "reconnected to redis")
 	}
-	if u.spot != nil && (u.set.Eff.DeviceName != oldDevice || u.set.Eff.Bitrate != oldBitrate) {
+	// The container's sink and mpv's demuxer are both fixed at spawn time, so a
+	// new depth means a new backend. Dropping it here is enough: the next
+	// Spotify play starts one at the new depth (see ensureSpotify).
+	if u.set.Eff.CaptureBits != oldBits && u.stopSpotify() {
+		notes = append(notes, "restarting capture at "+strconv.Itoa(u.set.Eff.CaptureBits)+"-bit")
+	}
+	if u.spotify() != nil && (u.set.Eff.DeviceName != oldDevice || u.set.Eff.Bitrate != oldBitrate) {
 		notes = append(notes, "device name/bitrate apply after restart")
 	}
 

@@ -31,10 +31,12 @@ type Config struct {
 	// SoloistImage is the container image built from docker/Dockerfile.
 	SoloistImage string `json:"soloist_image"`
 
-	// Lossless captures Soloist's output at 32 bits instead of 16. Spotify's
-	// lossless tier carries more than 16 bits, and a 16-bit capture would throw
-	// that away before SEHO ever saw it.
-	Lossless bool `json:"lossless"`
+	// CaptureBits is the sample depth SEHO captures Soloist's output at: 16,
+	// 24 or 32. Spotify's lossless tier is FLAC up to 24-bit, so 16 truncates
+	// it before SEHO ever sees it, 24 carries it exactly, and 32 carries it
+	// with headroom to spare. Soloist itself has no quality flag (verified
+	// against its 1.3.7 CLI), so this is the only quality knob SEHO has.
+	CaptureBits int `json:"capture_bits"`
 }
 
 // EQConfig records which profile is selected and, when the user has edited its
@@ -68,7 +70,7 @@ func defaultConfig() Config {
 		EQ:             EQConfig{Enabled: true, Profile: defaultProfileName()},
 		SpotifyBackend: backendSoloist,
 		SoloistImage:   "seho-soloist:latest",
-		Lossless:       true,
+		CaptureBits:    captureBitsDefault,
 	}
 }
 

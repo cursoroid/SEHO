@@ -293,6 +293,10 @@ differently:
 | `/playlists/{id}/tracks` lists a playlist | Returns 403. The endpoint is `/playlists/{id}/items`, and each entry keys on `item`, not `track`. Playlist objects also carry the count under `items.total`, not `tracks.total` |
 | Premium is the only playback prerequisite | It is not. Spotify withholds audio keys from newer accounts on every librespot login path (librespot#1649). Everything up to decryption works; every track then skips. No client-side fix exists |
 | `Load` can be called inline from the UI | It cannot. Waiting for a librespot session can take as long as a human in a browser, so the Spotify play path runs off the tview goroutine |
+| Soloist exposes a stream-quality setting | It does not. `soloist --help` (1.3.7) has no bitrate or quality option, so the depth SEHO captures at is the only quality knob it has: `s16le` truncates a lossless stream, `s24le` matches Spotify's 24-bit maximum exactly, `s32le` adds headroom. All three verified working through the container's null sink and `parec`, and through mpv's rawaudio demuxer |
+| A FIFO can carry the capture into mpv | Not on macOS. POSIX leaves opening a FIFO `O_RDWR` undefined, and macOS turns that single handle into a private channel, so writes never reach mpv - which looked idle while bytes flowed and the filter chain was applied. `os.Pipe` plus `cmd.ExtraFiles` and `fd://3` is the working path |
+| `ctl trace` emits bare JSON lines | Each line is prefixed with a millisecond timestamp, so a `HasPrefix("{")` filter drops every event. The parser locates the object within the line, and its tests are built from payloads captured off a live daemon |
+| mpv can be pointed at the pipe as soon as it exists | It parks: the rawaudio demuxer never starts on a stream with no bytes yet. `Load` is deferred until the first captured byte arrives |
 
 ## Implementation order
 
