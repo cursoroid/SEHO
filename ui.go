@@ -294,6 +294,24 @@ func (u *UI) playRow(row int) {
 		return
 	}
 	u.table.Select(row+1, 0)
+	u.drawCard(u.shown[row])
+}
+
+const (
+	artCells = 28 // cells wide
+	artRows  = 14 // cell rows => 28 pixels tall
+)
+
+// drawCard paints the NOW PLAYING card: embedded album art (or a fallback
+// tile) plus the track's title and artist beneath it.
+func (u *UI) drawCard(it item) {
+	if it.path == "" {
+		u.card.SetText("")
+		return
+	}
+	art := AlbumArt(it.path, artCells, artRows)
+	u.card.SetText(fmt.Sprintf("\n%s\n  [%s::b]%s[-::-]\n  [%s]%s",
+		art, mocha.Text.String(), tview.Escape(it.title), mocha.Subtext0.String(), tview.Escape(it.desc)))
 }
 
 // progressBar renders a width-cell bar. Exactly width runes of content,
