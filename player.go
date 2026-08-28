@@ -10,8 +10,24 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// Backend is one audio source SEHO can drive. Two implementations exist:
+// *Player (mpv, below) and *SpotifyBackend (librespot piped into a second mpv,
+// see spotify_player.go). Load takes a file path for the former and a
+// spotify: URI for the latter.
+type Backend interface {
+	Load(target string) error
+	TogglePause() error
+	Seek(delta float64) error
+	SetVolume(v int) error
+	SetAF(chain string) error
+	Stop() error
+	Events() <-chan Event
+	Close() error
+}
 
 // Event is one state change pushed from mpv toward the UI.
 // Name is an mpv property name, or the literal "end-file".
@@ -48,22 +64,25 @@ type Player struct {
 	once   sync.Once
 }
 
-// StartPlayer spawns mpv in idle mode and attaches to its IPC socket.
-func StartPlayer() (*Player, error) {
+// StartPlayer spawns mpv in idle mode and attaches to its IPC socket. extra
+// carries per-instance flags: the Spotify instance adds raw-audio demuxer
+// options (see rawAudioArgs) because it reads a PCM fifo rather than files.
+func StartPlayer(extra ...string) (*Player, error) {
 	if _, err := exec.LookPath("mpv"); err != nil {
 		return nil, errors.New("mpv not found on PATH - install it with: brew install mpv")
 	}
 	// ponytail: macOS caps unix socket paths at 104 bytes and mpv fails silently
 	// past it. os.TempDir() is ~49 here, so this lands near 64. Move to /tmp if
 	// a long TMPDIR ever breaks it.
-	sock := filepath.Join(os.TempDir(), fmt.Sprintf("seho-%d.sock", os.Getpid()))
+	sock := filepath.Join(os.TempDir(), fmt.Sprintf("seho-%d-%d.sock", os.Getpid(), nextSockID()))
 	os.Remove(sock)
 
 	// --no-terminal is mandatory: without it mpv writes to our TTY and corrupts the UI.
-	cmd := exec.Command("mpv",
+	args := append([]string{
 		"--idle=yes", "--no-video", "--no-terminal", "--really-quiet",
-		"--input-ipc-server="+sock,
-	)
+		"--input-ipc-server=" + sock,
+	}, extra...)
+	cmd := exec.Command("mpv", args...)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start mpv: %w", err)
 	}
@@ -212,10 +231,40 @@ func (p *Player) post(args ...any) error {
 	return err
 }
 
+// nextSockID keeps two mpv instances in the same process from colliding on one
+// socket path. ponytail: a counter, not a UUID - the pid already scopes it.
+var sockSeq atomic.Int32
+
+func nextSockID() int32 { return sockSeq.Add(1) }
+
+// rawAudioArgs configures an mpv instance to read the raw stereo PCM that
+// librespot's pipe backend writes. The buffer settings matter: the default
+// cache would put the transport bar a second or more behind what you hear.
+func rawAudioArgs() []string {
+	return []string{
+		"--demuxer=rawaudio",
+		"--demuxer-rawaudio-format=s16le",
+		"--demuxer-rawaudio-rate=44100",
+		"--demuxer-rawaudio-channels=2",
+		"--cache=no",
+		"--audio-buffer=0.05",
+	}
+}
+
 func (p *Player) Load(path string) error   { return p.send("loadfile", path, "replace") }
 func (p *Player) TogglePause() error       { return p.post("cycle", "pause") }
 func (p *Player) Seek(delta float64) error { return p.post("seek", delta, "relative") }
 func (p *Player) SetVolume(v int) error    { return p.post("set_property", "volume", clampVol(v)) }
+
+// Stop ends playback without quitting mpv, so the instance stays available for
+// the next Load. Used when the transport moves to the other source.
+func (p *Player) Stop() error { return p.post("stop") }
+
+// SetAF replaces the audio filter chain. An empty chain clears it, which is how
+// the flat profile is expressed. Fire-and-forget for the same reason the
+// transport commands are: mpv either applies it or logs a filter error, and
+// blocking the UI on a reply would buy nothing.
+func (p *Player) SetAF(chain string) error { return p.post("set_property", "af", chain) }
 
 func (p *Player) Close() error {
 	p.once.Do(func() {

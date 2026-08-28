@@ -1,7 +1,6 @@
 package main
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -13,12 +12,27 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// source is where a row came from. Local rows are indexed in Redis and played
+// by path; Spotify rows are fetched live and played by URI.
+type source int
+
+const (
+	srcLocal source = iota
+	srcSpotify
+)
+
 type item struct {
 	title, desc, album, tags, path string
 	duration                       float64
 	addedAt                        time.Time
 	group                          bool   // true for a groupBy pseudo-row; never "the playing track"
 	groupField                     string // when group: which field it was grouped on ("Artists"/"Albums"/"Tags")
+	src                            source // srcLocal unless it came from the Spotify API
+	artURL                         string // Spotify cover art URL; empty for local files (art is embedded)
+
+	// playlistID is set on a Spotify playlist group row, so selecting it can
+	// fetch that playlist's tracks. Empty on every other row.
+	playlistID string
 }
 
 // setupLog sends log output to logs/seho.log, or nowhere if that is not writable.
@@ -55,13 +69,14 @@ func run() error {
 	closeLog := setupLog()
 	defer closeLog()
 
-	dir := cmp.Or(os.Getenv("MUSIC_DIR"), defaultMusicDir())
-	rdb := redis.NewClient(&redis.Options{
-		Addr: cmp.Or(os.Getenv("REDIS_ADDR"), "127.0.0.1:6379"),
-	})
+	// Settings come from the config file with environment variables layered on
+	// top, so the documented MUSIC_DIR / REDIS_ADDR workflow keeps working.
+	set := loadSettings()
+
+	rdb := redis.NewClient(&redis.Options{Addr: set.Eff.RedisAddr})
 	defer rdb.Close()
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		return fmt.Errorf("redis unreachable: %w", err)
+		return fmt.Errorf("redis unreachable at %s: %w", set.Eff.RedisAddr, err)
 	}
 
 	pl, err := StartPlayer()
@@ -70,5 +85,5 @@ func run() error {
 	}
 	defer pl.Close()
 
-	return NewUI(rdb, dir, pl).Run()
+	return NewUI(rdb, set, pl).Run()
 }

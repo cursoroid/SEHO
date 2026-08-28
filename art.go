@@ -2,14 +2,19 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"image"
 	"image/color"
 	_ "image/jpeg" // embedded cover art is almost always JPEG
 	_ "image/png"
+	"io"
+	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/dhowden/tag"
 )
@@ -75,6 +80,73 @@ func decodeCoverBytes(data []byte) (image.Image, error) {
 
 	img, _, err := image.Decode(bytes.NewReader(data))
 	return img, err
+}
+
+// artCache holds decoded remote covers, keyed by URL. Spotify art arrives over
+// the network, so re-rendering the card on a resize must not re-fetch it.
+// ponytail: an unbounded map, and a nil entry marks a URL that already failed.
+// A session touches tens of covers, each a few KB decoded at 28x28; add
+// eviction if that ever stops being true.
+var artCache sync.Map // url -> image.Image, or nil for a known failure
+
+// AlbumArtURL is AlbumArt for a remote cover: fetched and decoded once, then
+// rendered from cache. Falls back to the same generated tile as AlbumArt when
+// the fetch or decode fails, so a flaky network costs the picture and nothing
+// else.
+func AlbumArtURL(url, album string, w, h int) string {
+	if w <= 0 || h <= 0 {
+		return ""
+	}
+	img, err := remoteCover(url)
+	if err != nil {
+		seed := album
+		if seed == "" {
+			seed = url
+		}
+		return fallbackBlock(seed, w, h)
+	}
+	return halfBlocks(img, w, h)
+}
+
+func remoteCover(url string) (image.Image, error) {
+	if url == "" {
+		return nil, errors.New("no cover url")
+	}
+	if cached, ok := artCache.Load(url); ok {
+		img, ok := cached.(image.Image)
+		if !ok || img == nil {
+			return nil, errors.New("cover previously failed")
+		}
+		return img, nil
+	}
+
+	img, err := fetchCover(url)
+	if err != nil {
+		artCache.Store(url, nil)
+		return nil, err
+	}
+	artCache.Store(url, img)
+	return img, nil
+}
+
+func fetchCover(url string) (image.Image, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cover fetch: %s", resp.Status)
+	}
+	// Spotify's smallest cover is 64px; 4MB is generous for that and bounds a
+	// hostile or misconfigured response. decodeCoverBytes applies the same
+	// dimension gate embedded art goes through.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	return decodeCoverBytes(data)
 }
 
 // halfBlocks maps the image onto a w×h grid of cells. Each cell is the

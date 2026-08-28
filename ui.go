@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"slices"
 	"strings"
 
@@ -19,8 +20,24 @@ type UI struct {
 	app *tview.Application
 	rdb *redis.Client
 	dir string
-	pl  *Player
 
+	// set is the live settings state: File is what Save writes, Eff is what the
+	// app reads. The settings page edits it in place.
+	set Settings
+
+	// local plays files; spot plays Spotify and is created on first use, so a
+	// user who never touches Spotify never spawns librespot. active says which
+	// one owns the transport - events from the other are ignored.
+	local  *Player
+	spot   *SpotifyBackend
+	api    *Spotify
+	active source
+
+	// eq is the live profile. It may differ from the saved one while the sound
+	// page is open, which is what makes auditioning a curve possible.
+	eq profile
+
+	pages     *tview.Pages
 	header    *tview.TextView
 	sidebar   *tview.List
 	table     *tview.Table
@@ -44,6 +61,14 @@ type UI struct {
 	// for, so repeated draws at the same width are a no-op.
 	layoutWidth int
 
+	// spotifyView is true when the current base view came from the Spotify API,
+	// which is what makes "/" search the catalogue instead of the local list.
+	spotifyView bool
+
+	// searchRemote is true while the search field is querying Spotify rather
+	// than fuzzy-filtering the local base view.
+	searchRemote bool
+
 	// focusedSidebar tracks whether the sidebar currently holds focus.
 	// relayout cannot call u.app.GetFocus()/SetFocus() to find out: it runs
 	// from SetBeforeDrawFunc, which tview invokes while Application.draw()
@@ -58,13 +83,16 @@ type UI struct {
 	nowTitle, nowArtist, nowPath string
 }
 
-func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
+func NewUI(rdb *redis.Client, set Settings, pl *Player) *UI {
 	applyTheme()
 	u := &UI{
 		app: tview.NewApplication(),
-		rdb: rdb, dir: dir, pl: pl,
+		rdb: rdb, dir: set.Eff.MusicDir, set: set,
+		local:   pl,
+		api:     NewSpotify(set.Eff.SpotifyClientID),
 		playing: -1,
 	}
+	u.eq = startupProfile(set.Eff.EQ)
 
 	u.header = textPane("")
 	u.header.SetBorder(true)
@@ -80,6 +108,13 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 			u.filterBySection(s)
 			u.focus(u.table)
 		})
+	}
+	// A separator, then the Spotify views. Selecting the separator does
+	// nothing; it exists so the two libraries do not read as one list.
+	u.sidebar.AddItem(strings.Repeat("─", 12), "", 0, nil)
+	for _, s := range spotifySections {
+		s := s
+		u.sidebar.AddItem(s, "", 0, func() { u.openSpotifySection(s) })
 	}
 
 	u.table = tview.NewTable().SetFixed(1, 0).SetSelectable(true, false)
@@ -99,8 +134,21 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 	u.search.SetFieldBackgroundColor(mocha.Mantle).
 		SetFieldTextColor(mocha.Text).
 		SetLabelColor(mocha.Mauve)
-	u.search.SetChangedFunc(func(q string) { u.applyFilter(q) })
+	u.search.SetChangedFunc(func(q string) {
+		if u.searchRemote {
+			return // remote search runs on enter, not per keystroke
+		}
+		u.applyFilter(q)
+	})
 	u.search.SetDoneFunc(func(key tcell.Key) {
+		if u.searchRemote && key == tcell.KeyEnter {
+			q := u.search.GetText()
+			u.closeSearch(false)
+			if strings.TrimSpace(q) != "" {
+				go u.searchSpotify(q)
+			}
+			return
+		}
 		u.closeSearch(key == tcell.KeyEscape)
 	})
 
@@ -125,10 +173,34 @@ func NewUI(rdb *redis.Client, dir string, pl *Player) *UI {
 		return false // false = let tview draw normally
 	})
 
-	u.app.SetRoot(u.root, true)
+	// Pages exists so the settings and sound pages can take the whole terminal
+	// without the responsive body Flex having to know they exist.
+	u.pages = tview.NewPages().AddPage(pageMain, u.root, true, true)
+	u.app.SetRoot(u.pages, true)
 	u.focus(u.table)
 	return u
 }
+
+// spotifySections are the sidebar rows below the separator.
+var spotifySections = []string{"Spotify Search", "Liked Songs", "Playlists"}
+
+// startupProfile resolves the saved EQ configuration into a live profile,
+// preferring hand-edited bands when the config carries them.
+func startupProfile(cfg EQConfig) profile {
+	p, ok := profileByKey(cfg.Profile)
+	if !ok {
+		p, _ = profileByKey(defaultProfileName())
+	}
+	if len(cfg.Bands) > 0 {
+		p.Bands = cfg.Bands
+		p.Name += " (edited)"
+	}
+	return p
+}
+
+// envLookup exists so applyEnv can be called with the real environment from
+// code that must not import os for one call.
+func envLookup(key string) string { return os.Getenv(key) }
 
 // relayout hides columns that no longer fit. tview has no breakpoints, so this
 // rebuilds the body Flex on width change.
@@ -371,6 +443,7 @@ func (u *UI) resyncPlaying(path string) {
 // filterByGroup) handled by selecting a row, so there is no nested
 // navigation state - the sidebar is filter-only, never a drill-down that plays.
 func (u *UI) filterBySection(section string) {
+	u.spotifyView = false
 	switch section {
 	case "All Tracks":
 		u.base = u.all
@@ -500,6 +573,59 @@ func (u *UI) refreshHeader() {
 	u.header.SetText(strings.Join(rows, "\n"))
 }
 
+// backendFor returns the backend that plays items from src, creating the
+// Spotify one on first use.
+func (u *UI) backendFor(src source) (Backend, error) {
+	if src == srcLocal {
+		return u.local, nil
+	}
+	return u.ensureSpotify()
+}
+
+// current is the backend that owns the transport right now.
+func (u *UI) current() Backend {
+	if u.active == srcSpotify && u.spot != nil {
+		return u.spot
+	}
+	return u.local
+}
+
+// stopOther silences the source that is losing the transport.
+func (u *UI) stopOther(next source) {
+	switch {
+	case next == srcSpotify && u.local != nil:
+		u.local.Stop()
+	case next == srcLocal && u.spot != nil:
+		u.spot.Stop()
+	}
+}
+
+// ensureSpotify starts librespot and its mpv instance on first Spotify play.
+// It is deliberately lazy: spawning librespot at startup would demand a login
+// from someone who only ever wanted to play their own files.
+func (u *UI) ensureSpotify() (Backend, error) {
+	if u.spot != nil {
+		return u.spot, nil
+	}
+	if !u.api.Connected() {
+		return nil, fmt.Errorf("connect Spotify in settings first (press ,)")
+	}
+
+	sp, err := StartSpotifyBackend(u.api, u.set.Eff, func(url string) {
+		u.app.QueueUpdateDraw(func() {
+			u.setStatus(fmt.Sprintf("[%s]librespot sign-in: %s", mocha.Subtext0.String(), tview.Escape(url)))
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	u.spot = sp
+	go u.pumpEvents(srcSpotify, sp.Events())
+	sp.SetVolume(u.vol)
+	u.applyEQ()
+	return sp, nil
+}
+
 func (u *UI) playRow(row int) {
 	// Belt-and-braces: playRow is the single choke point every play path runs
 	// through, so it refuses a group pseudo-row here too, on top of the
@@ -508,16 +634,33 @@ func (u *UI) playRow(row int) {
 	if row < 0 || row >= len(u.shown) || u.shown[row].group {
 		return
 	}
+	it := u.shown[row]
+	b, err := u.backendFor(it.src)
+	if err != nil {
+		u.setStatus(errMarkup(err.Error()))
+		return
+	}
+
+	// Only one source plays at a time, and they are separate processes, so the
+	// outgoing one has to be told explicitly - otherwise a Spotify track starts
+	// on top of the local file that is still playing.
+	if it.src != u.active {
+		u.stopOther(it.src)
+		u.active = it.src
+		b.SetVolume(u.vol)
+		u.applyEQ()
+	}
+
 	u.playing = row
-	u.nowTitle, u.nowArtist, u.nowPath = u.shown[row].title, u.shown[row].desc, u.shown[row].path
-	u.pos, u.dur = 0, u.shown[row].duration
-	if err := u.pl.Load(u.shown[row].path); err != nil {
-		u.setStatus(fmt.Sprintf("[%s]playback failed: %v", mocha.Red.String(), tview.Escape(err.Error())))
+	u.nowTitle, u.nowArtist, u.nowPath = it.title, it.desc, it.path
+	u.pos, u.dur = 0, it.duration
+	if err := b.Load(it.path); err != nil {
+		u.setStatus(errMarkup("playback failed: " + err.Error()))
 		return
 	}
 	u.table.Select(row+1, 0)
 	u.repaintMarkers()
-	u.drawCard(u.shown[row])
+	u.drawCard(it)
 }
 
 // repaintMarkers refreshes the playing indicator and row colour in place.
@@ -639,6 +782,11 @@ func (u *UI) drawCard(it item) {
 
 	indent := strings.Repeat(" ", max(0, (w-cells)/2))
 	art := AlbumArt(it.path, it.album, cells, rows)
+	if it.src == srcSpotify {
+		// Spotify tracks have no local file to read tags from; the cover comes
+		// from the API as a URL.
+		art = AlbumArtURL(it.artURL, it.album, cells, rows)
+	}
 	lines := strings.Split(strings.TrimRight(art, "\n"), "\n")
 	for i, l := range lines {
 		lines[i] = indent + l
@@ -834,18 +982,26 @@ func (u *UI) reload() {
 	u.table.SetTitle(u.baseTitle)
 }
 
-// pumpEvents forwards mpv state onto the UI goroutine. Runs for the app's life.
-func (u *UI) pumpEvents() {
-	for ev := range u.pl.Events() {
+// pumpEvents forwards one backend's state onto the UI goroutine. One goroutine
+// runs per backend for the app's life; events from the source that does not
+// currently own the transport are dropped, so a paused-but-alive Spotify poller
+// cannot rewrite the clock of a local track.
+func (u *UI) pumpEvents(src source, events <-chan Event) {
+	for ev := range events {
 		ev := ev
 		u.app.QueueUpdateDraw(func() {
+			if src != u.active {
+				return
+			}
 			switch ev.Name {
 			case "time-pos":
 				u.pos = ev.Num
 			case "duration":
 				u.dur = ev.Num
 				// Backfill tracks indexed without ffprobe.
-				if u.playing >= 0 && u.playing < len(u.shown) && u.shown[u.playing].duration <= 0 {
+				// Backfill is for local files only: a Spotify duration belongs
+				// to a URI that is not in the Redis index at all.
+				if src == srcLocal && u.playing >= 0 && u.playing < len(u.shown) && u.shown[u.playing].duration <= 0 {
 					u.shown[u.playing].duration = ev.Num
 					// u.shown may be a filtered copy of u.all (applyFilter), so the
 					// write above would not otherwise reach the backing library data.
@@ -877,7 +1033,7 @@ func (u *UI) pumpEvents() {
 					u.advance()
 				}
 			case "disconnected":
-				u.setStatus(fmt.Sprintf("[%s]lost connection to mpv", mocha.Red.String()))
+				u.setStatus(errMarkup("lost connection to mpv"))
 				return
 			}
 			u.drawTransport()
@@ -889,10 +1045,16 @@ func (u *UI) Run() error {
 	u.reload()
 	u.setFooter()
 	u.bindKeys()
-	u.vol = 100
-	go u.pumpEvents()
+	u.vol = clampVol(u.set.Eff.Volume)
+	u.local.SetVolume(u.vol)
+	u.applyEQ()
+	go u.pumpEvents(srcLocal, u.local.Events())
 	u.drawTransport()
-	return u.app.Run()
+	err := u.app.Run()
+	if u.spot != nil {
+		u.spot.Close()
+	}
+	return err
 }
 
 // setFooter rebuilds the key-hint bar. "tab pane" only makes sense once the
@@ -903,7 +1065,7 @@ func (u *UI) setFooter() {
 	if u.layoutWidth >= 80 {
 		keys = append(keys, "tab[-] pane")
 	}
-	keys = append(keys, "s[-] scan", "q[-] quit")
+	keys = append(keys, "s[-] scan", ",[-] settings", "e[-] sound", "q[-] quit")
 
 	var b strings.Builder
 	for _, k := range keys {
@@ -912,11 +1074,20 @@ func (u *UI) setFooter() {
 	u.footer.SetText(b.String())
 }
 
-// openSearch replaces the footer row with the search field while active.
-func (u *UI) openSearch() {
+// openSearch replaces the footer row with the search field while active. remote
+// switches it from fuzzy-filtering the local view to querying Spotify, which
+// only happens on enter - one API call per keystroke would be both slow and
+// rude to the rate limiter.
+func (u *UI) openSearch(remote bool) {
+	u.searchRemote = remote
 	u.root.RemoveItem(u.footer)
 	u.root.AddItem(u.search, 1, 0, true)
 	u.search.SetText("")
+	label := " search: "
+	if remote {
+		label = " spotify: "
+	}
+	u.search.SetLabel(label)
 	u.focusedSidebar = false
 	u.app.SetFocus(u.search)
 }
@@ -925,9 +1096,11 @@ func (u *UI) openSearch() {
 func (u *UI) closeSearch(clear bool) {
 	u.root.RemoveItem(u.search)
 	u.root.AddItem(u.footer, 1, 0, false)
-	if clear {
+	u.search.SetLabel(" search: ")
+	if clear && !u.searchRemote {
 		u.applyFilter("")
 	}
+	u.searchRemote = false
 	u.focus(u.table)
 }
 
@@ -942,6 +1115,12 @@ func (u *UI) bindKeys() {
 		// than playing the pseudo-row's representative file under fake
 		// metadata (it would otherwise read e.g. "AC/DC · Artists").
 		if it := u.shown[idx]; it.group {
+			// A Spotify playlist row fetches its tracks; a local group row
+			// filters the library. Same pseudo-row mechanism, two sources.
+			if it.playlistID != "" {
+				go u.loadPlaylist(it.playlistID, it.title)
+				return
+			}
 			u.filterByGroup(it.groupField, it.title)
 			return
 		}
@@ -949,6 +1128,18 @@ func (u *UI) bindKeys() {
 	})
 
 	u.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		// The settings and sound pages own the keyboard while they are up:
+		// their fields need plain letters, and 'q' must not quit mid-edit.
+		// Escape is the one key this layer still handles, so there is always a
+		// way back to the player.
+		if name, _ := u.pages.GetFrontPage(); name != pageMain {
+			if ev.Key() == tcell.KeyEscape {
+				u.closePage()
+				return nil
+			}
+			return ev
+		}
+
 		// Let the search field consume everything except escape.
 		if u.app.GetFocus() == u.search && ev.Key() != tcell.KeyEscape {
 			return ev
@@ -965,15 +1156,21 @@ func (u *UI) bindKeys() {
 			u.cycleFocus(-1)
 			return nil
 		case tcell.KeyLeft:
-			u.pl.Seek(-5)
+			u.current().Seek(-5)
 			return nil
 		case tcell.KeyRight:
-			u.pl.Seek(5)
+			u.current().Seek(5)
 			return nil
 		}
 		switch ev.Rune() {
 		case '/':
-			u.openSearch()
+			u.openSearch(u.spotifyView)
+			return nil
+		case ',':
+			u.showSettings()
+			return nil
+		case 'e':
+			u.showSound()
 			return nil
 		case 'q':
 			u.app.Stop()
@@ -982,7 +1179,7 @@ func (u *UI) bindKeys() {
 			go u.scan()
 			return nil
 		case ' ':
-			u.pl.TogglePause()
+			u.current().TogglePause()
 			return nil
 		case 'n':
 			switch {
@@ -1000,11 +1197,11 @@ func (u *UI) bindKeys() {
 			return nil
 		case '-':
 			u.vol = clampVol(u.vol - 5)
-			u.pl.SetVolume(u.vol)
+			u.current().SetVolume(u.vol)
 			return nil
 		case '=':
 			u.vol = clampVol(u.vol + 5)
-			u.pl.SetVolume(u.vol)
+			u.current().SetVolume(u.vol)
 			return nil
 		}
 		return ev
