@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/redis/go-redis/v9"
@@ -29,9 +31,13 @@ type UI struct {
 	// local plays files; spot plays Spotify and is created on first use, so a
 	// user who never touches Spotify never spawns librespot. active says which
 	// one owns the transport - events from the other are ignored.
+	//
+	// active is atomic because the level meter polls current() from its own
+	// goroutine: it has to know which backend to ask, and it cannot take the
+	// tview lock to find out.
 	local  *Player
 	api    *Spotify
-	active source
+	active atomic.Int32
 
 	// spot is created lazily and read from both the UI goroutine and the
 	// goroutine that starts it, so every access goes through spotMu. Its
@@ -75,6 +81,13 @@ type UI struct {
 	// Save stores it in the keychain.
 	soloistKeyEdit string
 
+	// The cached Soloist readiness verdict. The probes shell out to docker, so
+	// they run on their own goroutine and the settings page reads the last
+	// answer - see soloistReady.
+	soloistMu  sync.Mutex
+	soloistErr error
+	soloistAt  time.Time
+
 	// searchRemote is true while the search field is querying Spotify rather
 	// than fuzzy-filtering the local base view.
 	searchRemote bool
@@ -91,6 +104,25 @@ type UI struct {
 	paused                       bool
 	vol                          int
 	nowTitle, nowArtist, nowPath string
+
+	// What mpv reports about the audio itself, rather than what we asked it to
+	// do. coreIdle and buffering come from property events; level is the meter
+	// reading, and levelOK is false when there is no reading to be had - which
+	// means nothing is decoding.
+	coreIdle  bool
+	buffering bool
+	// idleSince is when mpv last went idle, so the gap between one track
+	// ending and the next decoding is not reported as a stall.
+	idleSince   time.Time
+	level       float64
+	levelOK     bool
+	silentTicks int
+	// posTicks counts meter ticks during which the transport clock has not
+	// moved. A stalled audio device (Bluetooth headphones that went away, say)
+	// leaves mpv reporting "playing" with a frozen clock, and nothing else
+	// notices.
+	lastPos  float64
+	posTicks int
 }
 
 func NewUI(rdb *redis.Client, set Settings, pl *Player) *UI {
@@ -590,6 +622,24 @@ func (u *UI) spotify() Backend {
 	return u.spot
 }
 
+// activeSrc is which source owns the transport.
+func (u *UI) activeSrc() source { return source(u.active.Load()) }
+
+// clearNowPlaying returns the UI to a genuinely idle state. Every field that
+// says "something is playing" has to go together: clearing the title without
+// repainting the table left the ▶ marker sitting on a finished track, which is
+// how a played-out queue went on looking like it was still playing.
+func (u *UI) clearNowPlaying() {
+	u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
+	u.playing = -1
+	u.paused = false
+	u.pos, u.dur = 0, 0
+	u.coreIdle, u.buffering = true, false
+	u.levelOK, u.silentTicks, u.posTicks = false, 0, 0
+	u.repaintMarkers()
+	u.drawCard(item{})
+}
+
 // stopSpotify tears down the Spotify backend so the next play builds a fresh
 // one. Reports whether there was anything to tear down. Used when a setting is
 // baked into the backend at spawn time and cannot be changed in place.
@@ -602,15 +652,15 @@ func (u *UI) stopSpotify() bool {
 		return false
 	}
 	sp.Close()
-	if u.active == srcSpotify {
-		u.playing, u.nowPath = -1, ""
+	if u.activeSrc() == srcSpotify {
+		u.clearNowPlaying()
 	}
 	return true
 }
 
 // current is the backend that owns the transport right now.
 func (u *UI) current() Backend {
-	if u.active == srcSpotify {
+	if u.activeSrc() == srcSpotify {
 		if sp := u.spotify(); sp != nil {
 			return sp
 		}
@@ -717,9 +767,9 @@ func (u *UI) playRow(row int) {
 	// Only one source plays at a time, and they are separate processes, so the
 	// outgoing one has to be told explicitly - otherwise a Spotify track starts
 	// on top of the local file that is still playing.
-	if it.src != u.active {
+	if it.src != u.activeSrc() {
 		u.stopOther(it.src)
-		u.active = it.src
+		u.active.Store(int32(it.src))
 	}
 
 	u.playing = row
@@ -797,15 +847,12 @@ func nextPlayIndex(current, length int) (next int, ok bool) {
 // queue, by design.
 func (u *UI) advance() {
 	if u.playing < 0 {
-		u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
-		u.drawCard(item{})
+		u.clearNowPlaying()
 		return
 	}
 	next, ok := nextPlayIndex(u.playing, len(u.shown))
 	if !ok {
-		u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
-		u.playing = -1
-		u.drawCard(item{})
+		u.clearNowPlaying()
 		return
 	}
 	u.playRow(next)
@@ -875,12 +922,29 @@ func (u *UI) drawCard(it item) {
 }
 
 const (
-	headerRows     = 5   // 3 wordmark rows plus the border
-	transportRows  = 5   // cluster, title, bar, plus the border
-	cardBreakpoint = 110 // below this the card is not in the layout
-	sidebarCols    = 16
-	cardCols       = 32
-	volMeterCells  = 10
+	headerRows      = 5   // 3 wordmark rows plus the border
+	transportRows   = 5   // cluster, title, bar, plus the border
+	cardBreakpoint  = 110 // below this the card is not in the layout
+	sidebarCols     = 16
+	cardCols        = 32
+	volMeterCells   = 10
+	levelMeterCells = 8
+
+	// meterFloorDB is the bottom of the level meter, and silentTicksToWarn is
+	// how long the meter has to read silence before the transport says so - a
+	// quiet intro or a gap between phrases must not flicker the label.
+	meterFloorDB      = -60.0
+	silentTicksToWarn = 6 // at 4 Hz, ~1.5s
+
+	// stallGrace is how long mpv may sit idle before the transport calls it a
+	// stall. The gap between one track ending and the next decoding is real but
+	// short, and labelling it would make normal playback look broken.
+	stallGrace = 900 * time.Millisecond
+
+	// stallTicks is how many meter ticks the clock may sit still before the
+	// transport calls it stalled. Longer than the gap between position updates
+	// from either source, short enough to notice while a listener is waiting.
+	stallTicks = 8 // at 4 Hz, ~2s
 )
 
 // focus moves keyboard focus and recolours the pane borders to match.
@@ -974,6 +1038,56 @@ func progressBar(frac float64, width int, phase float64) string {
 // to 130%, but the meter is scaled to 100 so a normal full volume actually
 // looks full; anything above simply stays topped out while the numeric
 // percentage beside it stays exact.
+// stalled reports that playback has stopped moving while still claiming to
+// play: mpv sitting idle, or a transport clock that has not advanced. The
+// second case is what an audio device disappearing looks like - headphones that
+// went away leave mpv "playing" into a queue nobody drains.
+func (u *UI) stalled() bool {
+	if u.nowTitle == "" || u.paused {
+		return false
+	}
+	return u.posTicks >= stallTicks ||
+		(u.coreIdle && time.Since(u.idleSince) > stallGrace)
+}
+
+// levelMeter draws the audio actually leaving the filter chain, so the bar
+// moves with the music and sits empty when nothing is coming out. dBFS is
+// mapped from silence at meterFloorDB up to full scale; the range is what a
+// music signal occupies, not the full dynamic range of the format.
+func (u *UI) levelMeter(cells int) string {
+	if cells <= 0 {
+		return ""
+	}
+	frac := 0.0
+	// A stalled chain keeps reporting its last reading, which would leave the
+	// meter frozen mid-bar and read as sound.
+	if u.levelOK && u.nowTitle != "" && !u.paused && !u.stalled() {
+		frac = min(1.0, max(0.0, (u.level-meterFloorDB)/-meterFloorDB))
+	}
+	exact := frac * float64(cells)
+	full := min(int(exact), cells)
+	rem := int((exact - float64(full)) * 8)
+
+	var b strings.Builder
+	b.Grow(cells * 12)
+	for i := 0; i < cells; i++ {
+		colour := mocha.Green
+		if i >= cells-2 {
+			colour = mocha.Peach // the top of the meter, where clipping lives
+		}
+		switch {
+		case i < full:
+			fmt.Fprintf(&b, "[%s]█", colour.String())
+		case i == full && rem > 0:
+			fmt.Fprintf(&b, "[%s]%c", colour.String(), eighths[rem])
+		default:
+			fmt.Fprintf(&b, "[%s]░", mocha.Surface0.String())
+		}
+	}
+	b.WriteString("[-]")
+	return b.String()
+}
+
 func volMeter(v, cells int) string {
 	if cells <= 0 {
 		return ""
@@ -1004,12 +1118,21 @@ func (u *UI) drawTransport() {
 		return
 	}
 
-	icon, iconColor := "▶", mocha.Green
-	if u.paused {
-		icon, iconColor = "⏸", mocha.Red
-	}
-	if u.nowTitle == "" {
+	// The icon reports what the audio is doing, not what we asked for: green
+	// only when sound is actually coming out. state names the exception, so a
+	// stalled or silent stream is visible instead of looking like playback.
+	icon, iconColor, state := "▶", mocha.Green, ""
+	switch {
+	case u.nowTitle == "":
 		icon, iconColor = "■", mocha.Overlay0
+	case u.paused:
+		icon, iconColor = "⏸", mocha.Red
+	case u.buffering:
+		iconColor, state = mocha.Peach, "buffering"
+	case u.stalled():
+		iconColor, state = mocha.Peach, "stalled"
+	case u.silentTicks >= silentTicksToWarn:
+		iconColor, state = mocha.Lavender, "no sound"
 	}
 
 	// Row 1: transport cluster on the left, volume on the right. The prev/next
@@ -1017,8 +1140,12 @@ func (u *UI) drawTransport() {
 	// they sit in subtext and only the current state is coloured.
 	cluster := fmt.Sprintf("  [%s]⏮  [%s]%s[-]  [%s]⏭",
 		mocha.Overlay0.String(), iconColor.String(), icon, mocha.Overlay0.String())
-	vol := fmt.Sprintf("%s [%s]%3d%%  ", volMeter(u.vol, volMeterCells), mocha.Subtext0.String(), u.vol)
-	line1 := cluster + strings.Repeat(" ", padWidth(w, cluster, vol)) + vol
+	if state != "" {
+		cluster += fmt.Sprintf("  [%s]%s[-]", iconColor.String(), state)
+	}
+	right := fmt.Sprintf("%s  %s [%s]%3d%%  ", u.levelMeter(levelMeterCells),
+		volMeter(u.vol, volMeterCells), mocha.Subtext0.String(), u.vol)
+	line1 := cluster + strings.Repeat(" ", padWidth(w, cluster, right)) + right
 
 	// Row 2: what is playing. Only emit the separator when there is an artist,
 	// otherwise the idle line reads "nothing playing ·" with a dangling middot.
@@ -1070,7 +1197,7 @@ func (u *UI) pumpEvents(src source, events <-chan Event) {
 	for ev := range events {
 		ev := ev
 		u.app.QueueUpdateDraw(func() {
-			if src != u.active {
+			if src != u.activeSrc() {
 				return
 			}
 			switch ev.Name {
@@ -1097,8 +1224,16 @@ func (u *UI) pumpEvents(src source, events <-chan Event) {
 				u.paused = ev.Flag
 			case "volume":
 				u.vol = int(ev.Num)
+			case "core-idle":
+				if ev.Flag && !u.coreIdle {
+					u.idleSince = time.Now()
+				}
+				u.coreIdle = ev.Flag
+			case "paused-for-cache":
+				u.buffering = ev.Flag
 			case "end-file":
 				u.pos = 0
+				u.coreIdle, u.levelOK = true, false
 				// "stop" fires when a track is replaced deliberately (playRow's
 				// Load ends whatever was playing before it) - never advance for
 				// that, or a manual track change would double-advance past the
@@ -1116,16 +1251,56 @@ func (u *UI) pumpEvents(src source, events <-chan Event) {
 				// Spotify refused the decryption key. Do not advance: every
 				// track fails the same way for an affected account, and walking
 				// the queue would just spin through the whole list.
-				u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
-				u.playing = -1
-				u.paused = false
-				u.drawCard(item{})
+				u.clearNowPlaying()
 				u.setStatus(errMarkup("Spotify refused the decryption key - a known block on newer " +
 					"Spotify accounts (librespot issue 1649). Local files are unaffected."))
 				return
 			case "disconnected":
 				u.setStatus(errMarkup("lost connection to mpv"))
 				return
+			}
+			u.drawTransport()
+		})
+	}
+}
+
+// pumpLevel keeps the sound indicator honest. Everything else the UI knows
+// about playback is what it asked mpv to do; this is the one signal that says
+// whether audio is genuinely coming out - a stalled pipe, a silent stream or a
+// track that has quietly stopped all look identical without it.
+//
+// ponytail: a poll, not an event. mpv pushes property changes but filter
+// metadata is pull-only, and 4 Hz is enough for a meter a human is watching.
+func (u *UI) pumpLevel() {
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	for range t.C {
+		b := u.current()
+		if b == nil {
+			continue
+		}
+		db, ok := b.Level()
+		u.app.QueueUpdateDraw(func() {
+			// A reading only describes the backend that produced it, and the
+			// title is what tells us anything is meant to be playing at all.
+			if u.nowTitle == "" {
+				u.levelOK, u.silentTicks = false, 0
+				return
+			}
+			if u.paused {
+				u.posTicks = 0
+			} else if u.pos == u.lastPos {
+				u.posTicks++
+			} else {
+				u.posTicks = 0
+			}
+			u.lastPos = u.pos
+
+			u.level, u.levelOK = db, ok
+			if ok && db <= silenceFloor {
+				u.silentTicks++
+			} else {
+				u.silentTicks = 0
 			}
 			u.drawTransport()
 		})
@@ -1140,6 +1315,7 @@ func (u *UI) Run() error {
 	u.local.SetVolume(u.vol)
 	u.applyEQ()
 	go u.pumpEvents(srcLocal, u.local.Events())
+	go u.pumpLevel()
 	u.drawTransport()
 	err := u.app.Run()
 	if sp := u.spotify(); sp != nil {

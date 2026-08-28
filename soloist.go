@@ -62,9 +62,18 @@ type SoloistBackend struct {
 	pos, dur float64
 	speed    float64 // playback speed from Soloist's position anchor
 	playing  bool
-	uri      string
-	lastPos  time.Time
-	endSent  bool // guards against emitting end-file twice for one track
+	// uri is what Soloist last reported playing; want is what SEHO asked for.
+	// They diverge when Soloist advances its own queue past the end of our
+	// track, which is the only signal that the track finished when Soloist
+	// never reports a stop.
+	uri  string
+	want string
+	// onWant is true once Soloist has confirmed it is playing what SEHO asked
+	// for. Until then a mismatching item event is the previous track's event
+	// still in flight, not an advance past ours.
+	onWant  bool
+	lastPos time.Time
+	endSent bool // guards against emitting end-file twice for one track
 }
 
 // captureBits enumerates the sample depths the capture path supports, verified
@@ -76,6 +85,11 @@ type SoloistBackend struct {
 var captureBits = []int{32, 24, 16}
 
 const captureBitsDefault = 32
+
+// endSlack is how close to the reported duration counts as the end of a track.
+// The interpolated clock and Soloist's own idea of the end differ by a little,
+// and stopping a quarter-second early is inaudible where hanging is not.
+const endSlack = 0.25
 
 // soloistSampleFormat maps a capture depth to the PCM format name PulseAudio,
 // parec and mpv all share. An unknown depth falls back to the default rather
@@ -184,6 +198,7 @@ func StartSoloistBackend(cfg Config, apiKey string) (*SoloistBackend, error) {
 	}()
 
 	go s.awaitLogin()
+	go forwardMpvHealth(s.mpv, s.emit, s.closed)
 	return s, nil
 }
 
@@ -345,9 +360,14 @@ func (s *SoloistBackend) trace() {
 //	{"type":"auth_state","logged_in":true,"is_active":false,"device_name":"SEHO"}
 //	{"type":"position_sync","position":{"position_ms":30000,"timestamp_ms":...,"speed":0}}
 //	{"type":"playback_state","status":"playing","volume":40,"is_active":true,
-//	 "item":{"uri":"spotify:track:...","decorations":{"identity":{"name":"..."}},
-//	         "playback":{"duration_ms":180386}},
+//	 "item":{"uri":"spotify:track:...","entity_type":"track","decorations":{
+//	         "identity":{"name":"..."},"playback":{"duration_ms":180386}}},
 //	 "position":{"position_ms":6869,"timestamp_ms":...,"speed":1}}
+//
+// duration_ms lives under item.decorations.playback, which is worth stating
+// plainly: SEHO first looked for it under item.playback, found nothing, and
+// therefore never learned how long a track was - so a Spotify track had no end
+// and the transport showed it playing forever. Both paths are read now.
 //
 // The other types (playback_changed, volume_changed) carry the same fields.
 // Pointers distinguish absent from zero, so a payload that omits a field leaves
@@ -368,11 +388,27 @@ type soloistEvent struct {
 			Identity struct {
 				Name string `json:"name"`
 			} `json:"identity"`
+			Playback soloistPlayback `json:"playback"`
 		} `json:"decorations"`
-		Playback struct {
-			DurationMs *int `json:"duration_ms"`
-		} `json:"playback"`
+		Playback soloistPlayback `json:"playback"`
 	} `json:"item"`
+}
+
+type soloistPlayback struct {
+	DurationMs *int `json:"duration_ms"`
+}
+
+// duration reads the track length from wherever this payload carries it.
+func (i soloistEvent) duration() (float64, bool) {
+	if i.Item == nil {
+		return 0, false
+	}
+	for _, p := range []soloistPlayback{i.Item.Decorations.Playback, i.Item.Playback} {
+		if p.DurationMs != nil {
+			return float64(*p.DurationMs) / 1000, true
+		}
+	}
+	return 0, false
 }
 
 // traceLine splits one `ctl trace` line into its JSON payload. Lines are
@@ -419,13 +455,23 @@ func (s *SoloistBackend) handleTrace(line string) {
 	}
 	if ev.Item != nil {
 		if ev.Item.URI != "" {
+			// Soloist moving to a track SEHO did not ask for means ours played
+			// out: Soloist has its own queue and follows the Spotify context,
+			// while SEHO drives one URI at a time and owns the queue itself.
+			// Without this the transport would keep showing the finished track
+			// as playing while different audio came out of it.
+			switch {
+			case ev.Item.URI == s.want:
+				s.onWant = true
+			case s.onWant && !s.endSent:
+				s.endSent = true
+				finished = true
+			}
 			s.uri = ev.Item.URI
 		}
-		if d := ev.Item.Playback.DurationMs; d != nil {
-			if next := float64(*d) / 1000; next != s.dur {
-				s.dur = next
-				emitDur = true
-			}
+		if next, ok := ev.duration(); ok && next != s.dur {
+			s.dur = next
+			emitDur = true
 		}
 	}
 	switch ev.Status {
@@ -495,18 +541,27 @@ func (s *SoloistBackend) tick() {
 			p = dur
 		}
 		s.emit(Event{Name: "time-pos", Num: p})
+
+		// Soloist sends a position anchor once per track and nothing more, so
+		// nothing else here ever notices a track running out: the status stays
+		// "playing" (Soloist has moved on to its own next track) and the
+		// interpolated clock is the only thing that reaches the end.
+		if dur <= 0 || p < dur-endSlack {
+			continue
+		}
+		s.mu.Lock()
+		finished := !s.endSent
+		s.endSent = true
+		s.mu.Unlock()
+		if finished {
+			s.emit(Event{Name: "end-file", Reason: "eof"})
+		}
 	}
 }
 
 func (s *SoloistBackend) Events() <-chan Event { return s.events }
 
-func (s *SoloistBackend) emit(ev Event) {
-	select {
-	case s.events <- ev:
-	case <-s.closed:
-	default: // drop rather than stall the producer, as the other backends do
-	}
-}
+func (s *SoloistBackend) emit(ev Event) { emitEvent(s.events, s.closed, ev) }
 
 // Load plays one Spotify URI. It waits for the Soloist session first, which
 // after the initial pairing is immediate.
@@ -525,8 +580,8 @@ func (s *SoloistBackend) Load(uri string) error {
 	s.mu.Lock()
 	// speed 1 so the position interpolates from the moment playback starts,
 	// rather than waiting for Soloist's first position anchor.
-	s.uri, s.pos, s.playing, s.speed, s.lastPos = uri, 0, true, 1, time.Now()
-	s.endSent = false
+	s.uri, s.want, s.pos, s.playing, s.speed, s.lastPos = uri, uri, 0, true, 1, time.Now()
+	s.endSent, s.onWant = false, false
 	s.mu.Unlock()
 	s.emit(Event{Name: "pause", Flag: false})
 	return nil
@@ -579,6 +634,16 @@ func (s *SoloistBackend) Stop() error {
 	s.mu.Unlock()
 	_, err := s.ctl(context.Background(), "pause")
 	return err
+}
+
+// Level delegates to the mpv instance that consumes the captured stream, which
+// is where the audio actually becomes audible - and the only place that can
+// tell a live stream from a silent one.
+func (s *SoloistBackend) Level() (float64, bool) {
+	if s.mpv == nil {
+		return 0, false
+	}
+	return s.mpv.Level()
 }
 
 func (s *SoloistBackend) Close() error {

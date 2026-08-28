@@ -24,6 +24,11 @@ const (
 
 var bitrateChoices = []string{"96", "160", "320"}
 
+// soloistCheckTTL is how long a readiness verdict is trusted. Long enough that
+// opening the settings page twice does not re-run docker, short enough that
+// pairing or building the image shows up without a restart.
+const soloistCheckTTL = 30 * time.Second
+
 // showSettings builds and shows the settings page. It is rebuilt on every open
 // rather than kept around, so the fields always show current values and there is
 // no stale-form state to reconcile.
@@ -177,9 +182,58 @@ func maskKey(k string) string {
 	return k[:6] + "…" + k[len(k)-4:]
 }
 
-// soloistReady reports whether Soloist could stream right now, or why not. The
-// error text is what the settings page shows, so each case names its own fix.
+// errChecking is the readiness verdict before the first probe has answered. It
+// is a real state, not a failure: the checks shell out to docker and cannot run
+// on the tview goroutine without freezing the interface - including the
+// transport, which is how a finished track once stayed on screen as playing.
+var errChecking = errors.New("checking...")
+
+// soloistReady reports the last known readiness verdict, kicking a refresh when
+// the cached one is stale. Never blocks.
 func (u *UI) soloistReady() error {
+	u.soloistMu.Lock()
+	verdict, at := u.soloistErr, u.soloistAt
+	u.soloistMu.Unlock()
+
+	if time.Since(at) > soloistCheckTTL {
+		go u.refreshSoloist()
+		if at.IsZero() {
+			return errChecking
+		}
+	}
+	return verdict
+}
+
+// refreshSoloist runs the readiness probes off the UI goroutine and, when the
+// verdict changes, rebuilds the settings page - the quality selector only exists
+// while Soloist can actually stream, so the answer changes the layout.
+func (u *UI) refreshSoloist() {
+	verdict := u.probeSoloist()
+
+	u.soloistMu.Lock()
+	changed := u.soloistAt.IsZero() || errText(u.soloistErr) != errText(verdict)
+	u.soloistErr, u.soloistAt = verdict, time.Now()
+	u.soloistMu.Unlock()
+
+	if !changed {
+		return
+	}
+	u.app.QueueUpdateDraw(func() {
+		if name, _ := u.pages.GetFrontPage(); name == pageSettings {
+			u.showSettings()
+		}
+	})
+}
+
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// probeSoloist is the actual sequence of checks, each naming its own fix.
+func (u *UI) probeSoloist() error {
 	if u.set.Eff.SpotifyBackend != backendSoloist {
 		return errors.New("not in use - playback client is " + u.set.Eff.SpotifyBackend)
 	}

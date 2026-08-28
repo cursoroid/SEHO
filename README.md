@@ -18,6 +18,9 @@ playback through `librespot` and an equalizer that covers both.
   32-bit end to end, so the resolution of Spotify's lossless tier survives.
 - A parametric equalizer with sound profiles, applied to local files and
   Spotify alike. Imports AutoEq and Equalizer APO files.
+- A transport that reports the audio rather than the intent: a live level meter
+  fed by the actual filter output, and `buffering` / `stalled` / `no sound`
+  when playback claims to be running but nothing is coming out.
 - A settings page: music directory, Redis address, Spotify credentials,
   bitrate. Stored in `~/.config/seho/config.json`.
 
@@ -54,6 +57,8 @@ working; a field the environment controls shows read-only on the settings page.
 | - | `capture_bits` | `32` | Soloist capture depth: 16, 24 or 32 |
 | - | `soloist_image` | `seho-soloist:latest` | container image to run |
 | `SOLOIST_API_KEY` | - | - | Soloist key; otherwise read from the keychain |
+| `SEHO_NO_METER` | - | - | Set to disable the level meter filter |
+| `SEHO_MPV_LOG` | - | - | Set to a path to capture mpv's own verbose log |
 
 The Spotify refresh token and the Soloist API key are not stored in that file:
 they go to the macOS login keychain, falling back to `0600` files in

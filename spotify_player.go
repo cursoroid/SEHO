@@ -171,6 +171,7 @@ func StartSpotifyBackend(api *Spotify, cfg Config, announce func(string)) (*Spot
 
 	go s.poll()
 	go s.tick()
+	go forwardMpvHealth(s.mpv, s.emit, s.closed)
 	return s, nil
 }
 
@@ -301,13 +302,7 @@ func (s *SpotifyBackend) watchOutput(att *attempt, r io.Reader, announce func(st
 
 func (s *SpotifyBackend) Events() <-chan Event { return s.events }
 
-func (s *SpotifyBackend) emit(ev Event) {
-	select {
-	case s.events <- ev:
-	case <-s.closed:
-	default: // same reasoning as Player.emit: drop rather than stall the poller
-	}
-}
+func (s *SpotifyBackend) emit(ev Event) { emitEvent(s.events, s.closed, ev) }
 
 // session returns the Connect device id for our librespot, which is the only
 // proof that it actually signed in. On a first run the wait includes however
@@ -460,6 +455,11 @@ func (s *SpotifyBackend) Stop() error {
 
 func (s *SpotifyBackend) SetVolume(v int) error    { return s.mpv.SetVolume(v) }
 func (s *SpotifyBackend) SetAF(chain string) error { return s.mpv.SetAF(chain) }
+
+// Level comes from mpv for the same reason SetAF goes there: mpv is the end of
+// the audio path, so it is the only component that knows whether the pipe is
+// carrying sound or silence.
+func (s *SpotifyBackend) Level() (float64, bool) { return s.mpv.Level() }
 
 // poll asks Spotify what is playing once a second and reconciles local state.
 func (s *SpotifyBackend) poll() {
