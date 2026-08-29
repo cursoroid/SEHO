@@ -88,12 +88,13 @@ Keyboard-only; there is no mouse support.
 | `↑ / ↓` | Move the selection in the focused pane |
 | `enter` | Play the selected track, or activate the selected sidebar filter |
 | `/` | Open fuzzy search |
-| `esc` | Close search (also clears the current filter) |
+| `esc` | Close search (also clears the current filter), or leave focus mode |
 | `space` | Pause / resume |
 | `← / →` | Seek 5s back / forward |
 | `n / p` | Next / previous track |
 | `- / =` | Volume down / up |
 | `tab` / `shift+tab` | Cycle focus between the table and the sidebar (only when the sidebar fits - see Layout below) |
+| `f` | Focus mode - big album art, transport only |
 | `s` | Rescan the music directory |
 | `,` | Settings page |
 | `e` | Sound page (equalizer and profiles) |
@@ -101,6 +102,11 @@ Keyboard-only; there is no mouse support.
 
 On the sound page: `↑↓` picks a profile or band, `←→` trims the selected band
 by 0.5 dB, `0` zeroes it, `r` restores the profile as published, `s` saves.
+
+Focus mode (`f`) hides the header, sidebar and table, and gives the whole
+window to the album art with the transport bar underneath. The art is sized to
+the pane on every draw, so it follows terminal resizes. Playback keys (`space`,
+`←→`, `n/p`, `-/=`) work as usual; `esc` returns to the library.
 
 Logs go to `logs/seho.log`. Inspect the raw index with `redis-cli --scan --pattern 'music:*'`.
 

@@ -51,6 +51,7 @@ type UI struct {
 
 	pages     *tview.Pages
 	header    *tview.TextView
+	art       *tview.TextView
 	sidebar   *tview.List
 	table     *tview.Table
 	card      *tview.TextView
@@ -92,6 +93,13 @@ type UI struct {
 	// than fuzzy-filtering the local base view.
 	searchRemote bool
 
+	// focusMode swaps the library layout for a single large album-art pane
+	// plus the transport. layoutFocus is the mode u.root was last built for,
+	// so relayout knows to rebuild it - u.layoutWidth alone cannot tell, since
+	// a toggle happens at an unchanged terminal width.
+	focusMode   bool
+	layoutFocus bool
+
 	// focusedSidebar tracks whether the sidebar currently holds focus.
 	// relayout cannot call u.app.GetFocus()/SetFocus() to find out: it runs
 	// from SetBeforeDrawFunc, which tview invokes while Application.draw()
@@ -99,6 +107,12 @@ type UI struct {
 	// lock - calling either there deadlocks the very first draw. This bool
 	// is kept in sync by every place that actually moves focus instead.
 	focusedSidebar bool
+
+	// nowItem is the playing track itself, kept because u.nowPath cannot always
+	// resolve back to one: a Spotify track is not in u.all, and a local one is
+	// absent from u.shown whenever the current view filters it out. The focus
+	// pane repaints on resize, long after the play that set it.
+	nowItem item
 
 	pos, dur                     float64 // transport clock, seconds
 	paused                       bool
@@ -166,6 +180,11 @@ func NewUI(rdb *redis.Client, set Settings, pl *Player) *UI {
 
 	u.card = textPane("")
 	u.card.SetBorder(true).SetTitle(" NOW PLAYING ")
+	u.paintOnDraw(u.card, u.cardText)
+
+	u.art = textPane("")
+	u.art.SetBorder(true)
+	u.paintOnDraw(u.art, u.artText)
 
 	u.transport = textPane("")
 	u.transport.SetBorder(true)
@@ -195,13 +214,8 @@ func NewUI(rdb *redis.Client, set Settings, pl *Player) *UI {
 	})
 
 	u.body = tview.NewFlex()
-	u.root = tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(u.header, headerRows, 0, false).
-		AddItem(gutter(), 1, 0, false).
-		AddItem(u.body, 0, 1, true).
-		AddItem(gutter(), 1, 0, false).
-		AddItem(u.transport, transportRows, 0, false).
-		AddItem(u.footer, 1, 0, false)
+	u.root = tview.NewFlex().SetDirection(tview.FlexRow)
+	u.buildRoot()
 
 	// The panes fill themselves with base; the ground behind them is crust,
 	// one step darker. That contrast - not the rounded corners - is what makes
@@ -248,6 +262,21 @@ func envLookup(key string) string { return os.Getenv(key) }
 // rebuilds the body Flex on width change.
 // ponytail: rebuild rather than resize - three states, cheap, and it avoids
 // tracking per-item proportions.
+// buildRoot lays out the row stack. Focus mode drops the header and gives its
+// rows to the art; the transport stays, because in focus mode it is the only
+// thing that says what is playing.
+func (u *UI) buildRoot() {
+	u.root.Clear()
+	if !u.focusMode {
+		u.root.AddItem(u.header, headerRows, 0, false)
+		u.root.AddItem(gutter(), 1, 0, false)
+	}
+	u.root.AddItem(u.body, 0, 1, true).
+		AddItem(gutter(), 1, 0, false).
+		AddItem(u.transport, transportRows, 0, false).
+		AddItem(u.footer, 1, 0, false)
+}
+
 func (u *UI) relayout(width int) {
 	// refreshHeader recomputes every draw, not just on a width change:
 	// GetInnerRect reflects the *previous* draw's computed layout, so on the
@@ -256,12 +285,30 @@ func (u *UI) relayout(width int) {
 	// at that first, wrong guess until the next resize.
 	u.refreshHeader()
 
+	// A focus-mode toggle changes the rows, not the columns, so it has to be
+	// caught before the width guard below - the terminal has not resized.
+	if u.focusMode != u.layoutFocus {
+		u.layoutFocus = u.focusMode
+		u.buildRoot()
+		u.layoutWidth = -1 // the body belongs to the other mode; rebuild it
+	}
+
 	if width == u.layoutWidth {
 		return
 	}
 	u.layoutWidth = width
 
 	u.body.Clear()
+	if u.focusMode {
+		// Gutters on both sides as well as the ones buildRoot puts above and
+		// below: the crust showing through on all four edges is what makes the
+		// art read as floating rather than as a full-bleed background.
+		u.body.AddItem(gutter(), 1, 0, false).
+			AddItem(u.art, 0, 1, false).
+			AddItem(gutter(), 1, 0, false)
+		u.setFooter()
+		return
+	}
 	switch {
 	case width >= cardBreakpoint:
 		u.body.AddItem(u.sidebar, sidebarCols, 0, false).
@@ -275,19 +322,6 @@ func (u *UI) relayout(width int) {
 			AddItem(u.table, 0, 1, true)
 	default:
 		u.body.AddItem(u.table, 0, 1, true)
-	}
-
-	// drawCard is only ever called from playRow/advance, never from here, so
-	// widening back past the card breakpoint would otherwise leave it blank
-	// until the next track change (it was skipped while narrow - see
-	// drawCard's u.layoutWidth guard). Repaint from u.nowPath rather than
-	// u.playing: u.playing is -1 whenever the playing track is filtered out
-	// of the current u.shown, but u.nowPath + u.all always resolve it. Setting
-	// the TextView's text here is fine even though relayout runs inside
-	// SetBeforeDrawFunc with the app lock held; see the focus fix-up below for
-	// what is NOT safe to call from here.
-	if width >= cardBreakpoint && u.nowPath != "" {
-		u.drawCard(itemByPath(u.all, u.nowPath))
 	}
 
 	// Focus may have been on a pane that is now hidden. This cannot call
@@ -631,13 +665,13 @@ func (u *UI) activeSrc() source { return source(u.active.Load()) }
 // how a played-out queue went on looking like it was still playing.
 func (u *UI) clearNowPlaying() {
 	u.nowTitle, u.nowArtist, u.nowPath = "", "", ""
+	u.nowItem = item{}
 	u.playing = -1
 	u.paused = false
 	u.pos, u.dur = 0, 0
 	u.coreIdle, u.buffering = true, false
 	u.levelOK, u.silentTicks, u.posTicks = false, 0, 0
 	u.repaintMarkers()
-	u.drawCard(item{})
 }
 
 // stopSpotify tears down the Spotify backend so the next play builds a fresh
@@ -774,10 +808,10 @@ func (u *UI) playRow(row int) {
 
 	u.playing = row
 	u.nowTitle, u.nowArtist, u.nowPath = it.title, it.desc, it.path
+	u.nowItem = it
 	u.pos, u.dur = 0, it.duration
 	u.table.Select(row+1, 0)
 	u.repaintMarkers()
-	u.drawCard(it)
 
 	if it.src == srcSpotify {
 		// Off the UI goroutine: this can wait on a librespot login.
@@ -847,15 +881,35 @@ func nextPlayIndex(current, length int) (next int, ok bool) {
 // queue, by design.
 func (u *UI) advance() {
 	if u.playing < 0 {
-		u.clearNowPlaying()
+		u.endQueue()
 		return
 	}
 	next, ok := nextPlayIndex(u.playing, len(u.shown))
 	if !ok {
-		u.clearNowPlaying()
+		u.endQueue()
 		return
 	}
 	u.playRow(next)
+}
+
+// endQueue is the end of what SEHO had to play. It stops the audio as well as
+// clearing the transport, because Soloist follows the Spotify context: left
+// alone it plays on into its own next track and keeps reporting position, so
+// the transport said "nothing playing" over a clock that was still counting
+// up, with audible music under it. SEHO owns the queue; when the queue ends,
+// so does the sound.
+func (u *UI) endQueue() {
+	// Not u.current(): it falls back to u.local, which is nil in the tests and
+	// would be the wrong thing to stop anyway while Spotify owns the transport.
+	switch {
+	case u.activeSrc() == srcSpotify:
+		if sp := u.spotify(); sp != nil {
+			sp.Stop()
+		}
+	case u.local != nil:
+		u.local.Stop()
+	}
+	u.clearNowPlaying()
 }
 
 const (
@@ -876,49 +930,113 @@ func itemByPath(items []item, path string) item {
 	return item{}
 }
 
-// drawCard paints the NOW PLAYING card: embedded album art (or a fallback
-// tile) plus the track's title and artist beneath it.
-func (u *UI) drawCard(it item) {
-	if it.path == "" || u.layoutWidth < cardBreakpoint {
-		u.card.SetText("")
-		return
-	}
-	_, _, w, h := u.card.GetInnerRect()
+// minArtRows is the smallest art the renderer will draw. Below it the
+// half-block grid is too coarse to read as a picture.
+const minArtRows = 4
 
-	meta := fmt.Sprintf("  [%s::b]%s[-::-]\n  [%s]%s",
-		mocha.Text.String(), tview.Escape(it.title),
-		mocha.Subtext0.String(), tview.Escape(it.desc))
-
-	// Reserve four rows the art cannot have: the blank above it, the blank
-	// below it, and the two metadata lines. The art is
-	// square - one cell row is two pixels tall - so its width tracks whichever
-	// of height or width runs out first, rather than sitting at a fixed size
-	// that the pane may no longer have room for.
-	rows := min(artRows, h-4)
-	cells := min(artCells, w-2)
-	if cells > rows*2 {
-		cells = rows * 2
-	} else {
-		rows = cells / 2
+// fitArt sizes album art to a pane of w cells by h rows. Half-blocks make one
+// cell row two pixels tall, so square art needs twice as many cells as rows;
+// whichever dimension runs out first decides the size. ok is false when the
+// result would be too small to be worth drawing.
+func fitArt(w, h int) (cells, rows int, ok bool) {
+	rows = min(h, w/2)
+	if rows < minArtRows {
+		return 0, 0, false
 	}
-	if rows < 4 || cells < 8 {
-		// Too cramped for a legible image; the metadata is worth more.
-		u.card.SetText("\n" + meta)
-		return
-	}
+	return rows * 2, rows, true
+}
 
-	indent := strings.Repeat(" ", max(0, (w-cells)/2))
+// paintOnDraw repaints an album-art pane from the rect the layout actually gave
+// it, at draw time.
+//
+// The panes cannot paint themselves from GetInnerRect at the moment their
+// content changes: it returns the *previous* draw's rect, which for a pane that
+// has just entered the layout does not exist at all. That is how the focus pane
+// came up holding art four rows tall in a sixty-row terminal, and how the card
+// came back blank after focus mode - each painted against a rect that had not
+// been computed yet, and neither was repainted afterwards, because relayout
+// only fires on a width change.
+//
+// render is called only when the size or the track changes, so an idle redraw
+// costs a comparison rather than an image decode.
+func (u *UI) paintOnDraw(tv *tview.TextView, render func(w, h int) string) {
+	var lastW, lastH int
+	var lastKey string
+	tv.SetDrawFunc(func(_ tcell.Screen, x, y, w, h int) (int, int, int, int) {
+		// The draw function receives the outer rect and must return the inner
+		// one; these panes have a border and no padding.
+		ix, iy, iw, ih := x+1, y+1, w-2, h-2
+		if key := u.nowItem.path; iw != lastW || ih != lastH || key != lastKey {
+			lastW, lastH, lastKey = iw, ih, key
+			// Safe here: TextView.Draw calls this before it takes its own lock
+			// and reads the text, so the new content lands in this same frame.
+			tv.SetText(render(iw, ih))
+		}
+		return ix, iy, iw, ih
+	})
+}
+
+// artBlock renders an item's cover as centred lines within a pane w cells wide.
+func artBlock(it item, w, cells, rows int) string {
 	art := AlbumArt(it.path, it.album, cells, rows)
 	if it.src == srcSpotify {
 		// Spotify tracks have no local file to read tags from; the cover comes
 		// from the API as a URL.
 		art = AlbumArtURL(it.artURL, it.album, cells, rows)
 	}
+	indent := strings.Repeat(" ", max(0, (w-cells)/2))
 	lines := strings.Split(strings.TrimRight(art, "\n"), "\n")
 	for i, l := range lines {
 		lines[i] = indent + l
 	}
-	u.card.SetText("\n" + strings.Join(lines, "\n") + "\n\n" + meta)
+	return strings.Join(lines, "\n")
+}
+
+// cardText is the NOW PLAYING card: embedded album art (or a fallback tile)
+// plus the track's title and artist beneath it.
+func (u *UI) cardText(w, h int) string {
+	it := u.nowItem
+	if it.path == "" {
+		return ""
+	}
+	meta := fmt.Sprintf("  [%s::b]%s[-::-]\n  [%s]%s",
+		mocha.Text.String(), tview.Escape(it.title),
+		mocha.Subtext0.String(), tview.Escape(it.desc))
+
+	// Reserve four rows the art cannot have: the blank above it, the blank
+	// below it, and the two metadata lines.
+	cells, rows, ok := fitArt(min(w-2, artCells), min(h-4, artRows))
+	if !ok {
+		// Too cramped for a legible image; the metadata is worth more.
+		return "\n" + meta
+	}
+	return "\n" + artBlock(it, w, cells, rows) + "\n\n" + meta
+}
+
+// artText is the focus pane: album art alone, centred, as large as the pane
+// allows. The track's name is not repeated here - the transport bar directly
+// below already carries it.
+func (u *UI) artText(w, h int) string {
+	it := u.nowItem
+	// One column and one row of padding inside the border, so the art is not
+	// pressed against it.
+	cells, rows, ok := fitArt(w-2, h-2)
+	if it.path == "" || !ok {
+		return ""
+	}
+	return strings.Repeat("\n", max(0, (h-rows)/2)) + artBlock(it, w, cells, rows)
+}
+
+// toggleFocus enters or leaves focus mode. relayout does the rebuilding on the
+// next draw; this only has to move focus off a pane that is about to vanish.
+func (u *UI) toggleFocus() {
+	u.focusMode = !u.focusMode
+	if u.focusMode {
+		u.focusedSidebar = false
+		u.app.SetFocus(u.art)
+		return
+	}
+	u.focus(u.table)
 }
 
 const (
@@ -1329,10 +1447,19 @@ func (u *UI) Run() error {
 func (u *UI) setFooter() {
 	m := mocha.Mauve.String()
 	keys := []string{"/[-] search", "space[-] pause", "←→[-] seek", "n/p[-] track", "-/=[-] vol"}
+	if u.focusMode {
+		keys = []string{"space[-] pause", "←→[-] seek", "n/p[-] track", "-/=[-] vol", "esc[-] back", "q[-] quit"}
+		var b strings.Builder
+		for _, k := range keys {
+			fmt.Fprintf(&b, "  [%s]%s", m, k)
+		}
+		u.footer.SetText(b.String())
+		return
+	}
 	if u.layoutWidth >= 80 {
 		keys = append(keys, "tab[-] pane")
 	}
-	keys = append(keys, "s[-] scan", ",[-] settings", "e[-] sound", "q[-] quit")
+	keys = append(keys, "s[-] scan", "f[-] focus", ",[-] settings", "e[-] sound", "q[-] quit")
 
 	var b strings.Builder
 	for _, k := range keys {
@@ -1415,6 +1542,23 @@ func (u *UI) bindKeys() {
 			u.closeSearch(true)
 			return nil
 		}
+		if ev.Key() == tcell.KeyEscape && u.focusMode {
+			u.toggleFocus()
+			return nil
+		}
+		// Transport keys need something to act on. Without this, space after the
+		// queue ended resumed Soloist - which had moved on to the Spotify
+		// context - and the audio came back under a transport that still read
+		// "nothing playing". n is exempt: on a fresh start it means "play the
+		// first track", not "resume".
+		if u.nowPath == "" {
+			switch {
+			case ev.Key() == tcell.KeyLeft, ev.Key() == tcell.KeyRight,
+				ev.Rune() == ' ', ev.Rune() == 'p':
+				return nil
+			}
+		}
+
 		switch ev.Key() {
 		case tcell.KeyTab:
 			u.cycleFocus(1)
@@ -1438,6 +1582,9 @@ func (u *UI) bindKeys() {
 			return nil
 		case 'e':
 			u.showSound()
+			return nil
+		case 'f':
+			u.toggleFocus()
 			return nil
 		case 'q':
 			u.app.Stop()
